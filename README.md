@@ -22,6 +22,10 @@ python3 -m http.server 4173
 
 Then open <http://localhost:4173>.
 
+## GitHub Pages
+
+This is a static, no-build site. Enable **Settings → Pages → Deploy from a branch**, choose `main` and the `/ (root)` folder. GitHub will then serve the terminal from the repository Pages URL.
+
 ## Data integrity rules
 
 1. The displayed market is always BTCUSDT USD-M Futures.
