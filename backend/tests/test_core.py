@@ -24,6 +24,14 @@ class OrderBookTests(unittest.TestCase):
         with self.assertRaises(SequenceGap):
             book.apply({"U": 102, "u": 103, "pu": 999, "b": [], "a": []})
 
+    def test_snapshot_boundary_discards_stale_event(self):
+        book = LocalOrderBook()
+        book.buffer({"U": 100, "u": 100, "pu": 99, "b": [], "a": []})
+        book.buffer({"U": 101, "u": 101, "pu": 100, "b": [], "a": []})
+        book.apply_buffered(self.snapshot())
+        self.assertTrue(book.valid)
+        self.assertEqual(book.last_update_id, 101)
+
 
 class MarketStateTests(unittest.TestCase):
     def test_trade_metrics_have_event_and_receive_times(self):
