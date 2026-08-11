@@ -9,6 +9,7 @@ const CONFIG = {
   market: "USD-M FUTURES",
   rest: "https://fapi.binance.com/fapi/v1",
   ws: "wss://fstream.binance.com/stream?streams=",
+  backend: (new URLSearchParams(window.location.search).get("api") || window.CODEXIN_API_BASE || "").replace(/\/$/, ""),
   maxTrades: 600,
   maxTape: 32,
   bookLevels: 18,
@@ -25,7 +26,7 @@ const state = {
   liquidations: [], buckets: new Map(), profile: new Map(), klines: [],
   book: { bids: new Map(), asks: new Map(), lastUpdateId: null, lastEventId: null,
     valid: false, resyncs: 0, queue: [], syncing: false, renderQueued: false },
-  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, chart: null, candleSeries: null,
+  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, chart: null, candleSeries: null,
   volumeSeries: null
 };
 
@@ -57,6 +58,24 @@ async function json(url, options = {}) {
     if (!response.ok) throw Error(`HTTP ${response.status}`);
     return await response.json();
   } finally { clearTimeout(timer); }
+}
+
+async function pollBackendSnapshot() {
+  if (!CONFIG.backend) return;
+  try {
+    const snapshot = await json(`${CONFIG.backend}/live/${CONFIG.symbol}/futures/snapshot`, { timeout: 5000 });
+    state.backendHealth = snapshot.health || await json(`${CONFIG.backend}/health`, { timeout: 5000 });
+    const freshness = snapshot.freshness || {}, price = snapshot.price || {}, flow = snapshot.flow || {}, derivatives = snapshot.derivatives || {}, orderbook = snapshot.orderbook || {};
+    state.price = price.last ?? state.price; state.mark = price.mark ?? state.mark; state.index = price.index ?? state.index; state.cvd = Number(flow.cvd || 0); state.vwapPV = Number(flow.vwap || 0); state.vwapVolume = flow.vwap ? 1 : 0; state.tradeCount = Number(flow.trade_count || 0);
+    state.oi = derivatives.open_interest ?? state.oi; state.funding = derivatives.funding_rate ?? state.funding; state.ratios = derivatives.positioning ?? state.ratios;
+    state.buckets = new Map((flow.buckets || []).map(bucket => [Number(bucket.time), bucket]));
+    state.klines = (snapshot.candles?.rows || []).map(row => ({ time: Number(row.time), open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), volume: Number(row.volume), closed: Boolean(row.closed) }));
+    state.liquidations = snapshot.liquidations?.recent || [];
+    if (orderbook.bids && orderbook.asks) { state.book.bids = new Map(orderbook.bids.map(row => [String(row.price), Number(row.quantity)])); state.book.asks = new Map(orderbook.asks.map(row => [String(row.price), Number(row.quantity)])); state.book.lastUpdateId = orderbook.sequence; state.book.valid = Boolean(orderbook.valid); }
+    const age = value => value == null ? 0 : Math.max(1, Date.now() - Number(value)); state.lastTradeAt = age(freshness.trade_age_ms); state.lastBookAt = age(freshness.book_age_ms); state.lastKlineAt = age(snapshot.candles?.age_ms); state.lastOiAt = age(freshness.oi_age_ms); state.lastFundingAt = age(freshness.funding_age_ms); state.lastWsAt = Date.now();
+    setFeed("trades", state.backendHealth.feeds?.trades?.status || "WAITING"); setFeed("orderbook", state.backendHealth.feeds?.orderbook?.status || "WAITING");
+    renderAll();
+  } catch (error) { state.errors += 1; log(`Backend snapshot unavailable: ${error.message}`, "warn"); }
 }
 
 function streamUrl() {
@@ -343,7 +362,7 @@ function renderLiquidity(metrics = bookMetrics()) {
 
 function renderLiquidations() {
   const rows = state.liquidations.slice(0, 20), total = state.liquidations.reduce((sum, row) => sum + row.notional, 0), longLiq = state.liquidations.filter(row => row.side === "SELL").reduce((sum, row) => sum + row.notional, 0), shortLiq = state.liquidations.filter(row => row.side === "BUY").reduce((sum, row) => sum + row.notional, 0);
-  const live = state.wsConnected && Date.now() - state.lastWsAt < CONFIG.freshness.ws;
+  const backendLiq = state.backendHealth?.feeds?.liquidations?.status; const live = backendLiq ? backendLiq.startsWith("LIVE") : state.wsConnected && Date.now() - state.lastWsAt < CONFIG.freshness.ws;
   setText("liquidation-feed-status", live ? "LIVE / QUIET" : "UNAVAILABLE"); setText("liq-observed-total", usd(total)); setText("liq-long-total", usd(longLiq)); setText("liq-short-total", usd(shortLiq)); setText("liq-observed-age", state.lastLiquidationAt ? `Last event ${ago(state.lastLiquidationAt)} ago` : live ? "Connected · no events in session" : "Feed unavailable");
   $("liquidation-table").innerHTML = rows.length ? rows.map(row => `<tr><td class="${row.side === "SELL" ? "sell-text" : "buy-text"}">${row.side === "SELL" ? "LONG LIQ" : "SHORT LIQ"}</td><td>${new Date(row.time).toISOString().slice(11, 19)}</td><td>${usd(row.price)}</td><td>${usd(row.notional)}</td><td>${fmt(row.quantity, 3)}</td><td>${esc(row.position)}</td></tr>`).join("") : `<tr><td colspan="6" class="empty-state">No observed forceOrder events received in this session</td></tr>`;
 }
@@ -400,7 +419,8 @@ function feedRows() {
 }
 
 function renderHealth() {
-  const rows = feedRows(), critical = rows.slice(0, 6), degraded = critical.some(row => !row.status.startsWith("LIVE"));
+  const rows = state.backendHealth ? Object.entries(state.backendHealth.feeds || {}).map(([key, feed]) => ({ label: key.replaceAll("_", " ").toUpperCase(), status: feed.status === "LIVE_QUIET" ? "LIVE / QUIET" : feed.status, age: feed.age_ms, detail: `${feed.source} · ${feed.detail}` })) : feedRows();
+  const critical = rows.slice(0, 6), degraded = critical.some(row => !row.status.startsWith("LIVE"));
   setText("health-pill", degraded ? "DEGRADED" : "LIVE"); setClass("health-pill", `pill ${degraded ? "warning" : ""}`);
   $("health-grid").innerHTML = rows.map(row => `<div class="health-card ${row.status.startsWith("LIVE") ? "good" : "warn"}"><div class="health-title"><h3>${row.label}</h3><span class="health-state ${row.status.startsWith("LIVE") ? "good-text" : "warning-text"}">${row.status}</span></div><div class="health-meta"><span>${esc(row.detail)}</span><span class="health-age">${row.age == null ? "age —" : `age ${(row.age / 1000).toFixed(1)}s`}</span></div></div>`).join("");
   setClass("global-live-dot", `live-dot ${degraded ? "warning" : ""}`); setText("sidebar-health", degraded ? "DEGRADED" : "LIVE"); setClass("sidebar-health-ring", `status-ring ${degraded ? "warning" : ""}`); setText("sidebar-health-detail", degraded ? "Decision gate locked" : "Validated feeds active");
@@ -409,7 +429,7 @@ function renderHealth() {
 function renderHealthLog() { if ($("health-log")) $("health-log").innerHTML = state.events.map(event => `<div class="log-line"><b>${event.time.toISOString().slice(11, 19)} UTC</b><span class="${event.kind === "good" ? "log-good" : ""}">${esc(event.message)}</span></div>`).join("") || `<div class="empty-state">No system events</div>`; }
 
 function renderDecision() {
-  const metrics = bookMetrics(), now = Date.now(), wsLive = state.wsConnected && now - state.lastWsAt < CONFIG.freshness.ws;
+  const metrics = bookMetrics(), now = Date.now(), backendLiq = state.backendHealth?.feeds?.liquidations?.status, wsLive = backendLiq ? backendLiq.startsWith("LIVE") : state.wsConnected && now - state.lastWsAt < CONFIG.freshness.ws;
   const checks = [
     { label: "Futures trade stream", ok: state.lastTradeAt && now - state.lastTradeAt < CONFIG.freshness.trade, value: state.lastTradeAt ? "LIVE" : "WAITING" },
     { label: "L2 sequence validity", ok: metrics.valid && now - state.lastBookAt < CONFIG.freshness.book, value: metrics.valid ? "VALID" : "INVALID" },
@@ -438,8 +458,13 @@ function setupNav() {
 }
 
 async function boot() {
-  setupNav(); initChart(); renderAll(); await Promise.all([loadHistory(), loadDerivatives()]); openStream();
-  setInterval(loadDerivatives, 30000); setInterval(pollKline, 5000); setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderLiquidations, 5000); pollKline(); renderAll(); log("Terminal booted in read-only research mode", "good");
+  setupNav(); initChart(); renderAll();
+  if (CONFIG.backend) {
+    log(`Backend mode enabled: ${CONFIG.backend}`, "good"); await pollBackendSnapshot(); setInterval(pollBackendSnapshot, 1000);
+  } else {
+    await Promise.all([loadHistory(), loadDerivatives()]); openStream(); setInterval(loadDerivatives, 30000); setInterval(pollKline, 5000); pollKline();
+  }
+  setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderLiquidations, 5000); renderAll(); log("Terminal booted in read-only research mode", "good");
 }
 
 boot();

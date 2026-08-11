@@ -1,0 +1,50 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      CODEXIN_CORS_ORIGINS: ${CODEXIN_CORS_ORIGINS:-https://nurtacsuleymanzade-wq.github.io,http://localhost:4173}
+      CODEXIN_RAW_DIR: /app/data/raw-events
+      CODEXIN_REDIS_URL: redis://redis:6379/0
+      CODEXIN_CLICKHOUSE_URL: clickhouse://clickhouse:8123/default
+    ports:
+      - "8000:8000"
+    volumes:
+      - raw-events:/app/data/raw-events
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  raw-events:
+  redis-data:
+  clickhouse-data:

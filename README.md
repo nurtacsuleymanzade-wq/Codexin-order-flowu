@@ -29,6 +29,35 @@ Then open <http://localhost:4173>.
 
 This is a static, no-build site. Enable **Settings → Pages → Deploy from a branch**, choose `main` and the `/ (root)` folder. GitHub will then serve the terminal from the repository Pages URL.
 
+## Backend
+
+GitHub Pages cannot run collectors, Redis or ClickHouse. The backend in `backend/` is the live data plane.
+
+### Local backend with Docker
+
+```bash
+docker compose up --build
+curl http://localhost:8000/healthz
+```
+
+The API exposes the canonical contracts at:
+
+- `GET /api/v1/health`
+- `GET /api/v1/live/BTCUSDT/futures/snapshot`
+- `GET /api/v1/orderbook/live`
+- `GET /api/v1/flow/summary?tf=5m`
+- `GET /api/v1/liquidations/recent`
+- `GET /api/v1/probability-map/summary?tf=5m`
+- `GET /metrics`
+
+To point the static frontend at a deployed backend, append its versioned API base:
+
+```text
+https://nurtacsuleymanzade-wq.github.io/Codexin-order-flowu/?api=https://api.example.com/api/v1
+```
+
+Without `api=`, the frontend uses its safe direct read-only Binance fallback. It never falls back from Futures to Spot.
+
 ## Data integrity rules
 
 1. The displayed market is always BTCUSDT USD-M Futures.

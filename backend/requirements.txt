@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+websockets==14.2
+httpx==0.28.1
+pydantic==2.10.5
+typing_extensions==4.12.2
+redis==5.2.1
+clickhouse-connect==0.8.18

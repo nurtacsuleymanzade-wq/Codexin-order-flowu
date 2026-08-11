@@ -1,6 +1,6 @@
 # Codexin Order Flow architecture
 
-## Current release: browser terminal v0.1.0
+## Current release: browser terminal + backend data plane v0.3.0
 
 The repository is intentionally narrow: one venue, one market and one instrument.
 
@@ -27,6 +27,12 @@ NO TRADE gate when evidence is missing, stale or invalid
 - CVD and VWAP are session measurements derived from the received Futures trade stream.
 - Resting liquidity is observed displayed intent, not proof of execution or absorption.
 - Liquidation zones are estimated from an OI/leverage prior and are never labeled as observed force orders.
+
+## Implemented backend
+
+`backend/app/collector.py` owns the Binance USD-M Futures data plane. It consumes the verified Futures `@trade`, `@depth@100ms`, `@bookTicker` and `@forceOrder` streams, polls klines/derivatives through Futures REST, validates the local book and publishes one canonical health contract.
+
+Raw events are appended to an immutable hash-chained JSONL archive. Redis is used when configured for short-lived snapshots; ClickHouse is used when configured for raw event history. The service still runs with the local archive and in-memory state when those services are unavailable, and reports the degraded state instead of manufacturing data.
 
 ## Production target
 
