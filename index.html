@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07111f" />
+    <meta name="description" content="Market-data-first BTCUSDT USD-M Futures order-flow terminal." />
+    <title>Codexin Order Flow Terminal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.min.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark">C</div>
+          <div>
+            <div class="brand-name">CODEXIN <span>ORDER FLOW</span></div>
+            <div class="brand-subtitle">Market data first · research terminal</div>
+          </div>
+        </div>
+        <div class="market-identity">
+          <span class="live-dot" id="global-live-dot"></span>
+          <span>BINANCE</span><b>USD-M FUTURES</b><span class="symbol-chip">BTCUSDT</span>
+        </div>
+        <div class="top-actions">
+          <span class="read-only-badge">READ-ONLY / NO EXECUTION</span>
+          <button class="icon-btn" id="refresh-btn" title="Verileri yenile">↻</button>
+        </div>
+      </header>
+
+      <div class="terminal-layout">
+        <aside class="sidebar">
+          <div class="sidebar-label">WORKSPACE</div>
+          <button class="nav-item active" data-view="execution"><span>▦</span> Execution</button>
+          <button class="nav-item" data-view="liquidity"><span>◈</span> Liquidity</button>
+          <button class="nav-item" data-view="derivatives"><span>◌</span> Derivatives</button>
+          <button class="nav-item" data-view="context"><span>◒</span> Context</button>
+          <button class="nav-item" data-view="health"><span>✓</span> Data Health</button>
+          <div class="sidebar-divider"></div>
+          <div class="sidebar-label">MARKET</div>
+          <div class="market-mini-card">
+            <div class="muted">Instrument</div><strong>BTCUSDT</strong>
+            <div class="mini-row"><span>Type</span><b>Perpetual</b></div>
+            <div class="mini-row"><span>Quote</span><b>USDT</b></div>
+            <div class="mini-row"><span>Feed</span><b class="status-good">Futures</b></div>
+          </div>
+          <div class="sidebar-footer">
+            <span class="status-ring" id="sidebar-health-ring"></span>
+            <div><b id="sidebar-health">CONNECTING</b><small id="sidebar-health-detail">Connecting to Futures streams</small></div>
+          </div>
+        </aside>
+
+        <main class="main-content">
+          <section class="market-strip">
+            <div class="price-block"><span class="eyebrow">LAST TRADE</span><strong id="last-price">—</strong><span id="price-change" class="neutral">—</span></div>
+            <div class="strip-stat"><span>MARKET STATE</span><b id="market-state">WAITING</b><small id="market-state-detail">Awaiting validated feeds</small></div>
+            <div class="strip-stat"><span>1M DELTA</span><b id="delta-value">—</b><small id="delta-detail">No closed bucket yet</small></div>
+            <div class="strip-stat"><span>BOOK IMBALANCE</span><b id="book-imbalance">—</b><small id="book-detail">Order book syncing</small></div>
+            <div class="strip-stat"><span>DATA AGE</span><b id="data-age">—</b><small id="data-age-detail">No tick received</small></div>
+          </section>
+
+          <div class="view-panel active" id="view-execution">
+            <div class="view-heading"><div><span class="eyebrow">EXECUTION WORKSPACE</span><h1>Price, flow and intent</h1><p>Validated Futures executions are separated from displayed liquidity. This terminal never converts missing evidence into a neutral signal.</p></div><div class="view-controls"><button class="tf-btn active" data-interval="1m">1m</button><button class="tf-btn" data-interval="5m">5m</button><button class="tf-btn" data-interval="15m">15m</button><button class="tf-btn" data-interval="1h">1h</button></div></div>
+            <div class="alert-banner info"><span>i</span><div><b>Research mode</b><span>Decision engine is locked to <b>NO TRADE</b> until every required feed is fresh and calibrated.</span></div></div>
+            <div class="execution-grid">
+              <section class="card chart-card"><div class="card-head"><div><span class="eyebrow">MARKET STRUCTURE</span><h2>BTCUSDT · <span id="chart-interval">1m</span></h2></div><div class="legend"><span><i class="legend-candle up"></i>Price</span><span><i class="legend-line delta"></i>Delta</span></div></div><div id="price-chart" class="chart-wrap"></div><div class="chart-footer"><span><i class="status-dot good"></i>Futures klines</span><span id="chart-last-update">Last update —</span><span>Closed candles only for structure</span></div></section>
+              <section class="card dom-card"><div class="card-head"><div><span class="eyebrow">LIVE DOM</span><h2>Order book</h2></div><span class="feed-status" id="book-status">SYNCING</span></div><div class="book-summary"><div><span>BID</span><b id="best-bid">—</b></div><div><span>SPREAD</span><b id="spread-value">—</b></div><div><span>ASK</span><b id="best-ask">—</b></div></div><div class="book-columns"><div class="book-side-label ask-label">ASK <span id="ask-total">—</span></div><div class="book-side-label bid-label">BID <span id="bid-total">—</span></div></div><div id="orderbook" class="orderbook"></div><div class="dom-footer"><span id="book-sequence">Sequence —</span><span id="book-age">Age —</span></div></section>
+            </div>
+            <div class="lower-grid">
+              <section class="card footprint-card"><div class="card-head"><div><span class="eyebrow">EXECUTED FLOW</span><h2>Footprint buckets</h2></div><span class="feed-status good-text">REAL · AGGTRADE</span></div><div class="flow-legend"><span class="buy-text">BUY</span><span class="sell-text">SELL</span><span>∆ = buy − sell</span></div><div id="footprint" class="footprint"></div></section>
+              <section class="card tape-card"><div class="card-head"><div><span class="eyebrow">TIME & SALES</span><h2>Live tape</h2></div><span class="feed-status" id="tape-status">WAITING</span></div><div class="tape-head"><span>TIME</span><span>PRICE</span><span>SIZE</span><span>SIDE</span></div><div id="tape" class="tape"></div></section>
+              <section class="card decision-card"><div class="card-head"><div><span class="eyebrow">DECISION GATE</span><h2>Trade authorization</h2></div><span class="lock-icon">⌑</span></div><div class="decision-state"><div class="decision-icon">⏸</div><div><b>NO TRADE</b><span id="decision-reason">Waiting for complete, fresh and calibrated evidence.</span></div></div><div class="decision-checks" id="decision-checks"></div></section>
+            </div>
+          </div>
+
+          <div class="view-panel" id="view-liquidity">
+            <div class="view-heading"><div><span class="eyebrow">LIQUIDITY WORKSPACE</span><h1>Displayed intent and estimated risk</h1><p>Resting order-book liquidity and estimated liquidation zones are deliberately separated.</p></div><span class="pill warning">ESTIMATED ≠ OBSERVED</span></div>
+            <div class="metric-grid"><div class="metric-card"><span>Displayed bid notional</span><b id="liq-bid-notional">—</b><small id="liq-bid-share">—</small></div><div class="metric-card"><span>Displayed ask notional</span><b id="liq-ask-notional">—</b><small id="liq-ask-share">—</small></div><div class="metric-card"><span>Nearest estimated zone</span><b id="liq-nearest">—</b><small>OI cohort model</small></div><div class="metric-card"><span>Liquidation feed</span><b class="warning-text">UNAVAILABLE</b><small>Estimated zones only</small></div></div>
+            <div class="liquidity-grid"><section class="card liquidity-visual"><div class="card-head"><div><span class="eyebrow">PRICE AXIS</span><h2>Liquidity map</h2></div><span class="feed-status warning-text">MODEL / ESTIMATED</span></div><div class="axis-scale"><span>+2%</span><span>+1%</span><span>PRICE</span><span>−1%</span><span>−2%</span></div><div id="liquidity-bars" class="liquidity-bars"></div><div class="methodology"><b>Methodology</b><span>Estimated liquidation zones use open interest and a leverage prior. They are not observed account liquidation prices.</span></div></section><section class="card large-orders"><div class="card-head"><div><span class="eyebrow">OBSERVED</span><h2>Large resting orders</h2></div><span class="feed-status" id="large-order-status">SYNCING</span></div><div class="table-scroll"><table><thead><tr><th>Side</th><th>Price</th><th>Notional</th><th>Distance</th><th>Age</th><th>Intent</th></tr></thead><tbody id="large-orders-table"><tr><td colspan="6" class="empty-state">Waiting for validated order book</td></tr></tbody></table></div></section></div>
+          </div>
+
+          <div class="view-panel" id="view-derivatives">
+            <div class="view-heading"><div><span class="eyebrow">DERIVATIVES WORKSPACE</span><h1>Positioning and leverage context</h1><p>These metrics describe positioning; they do not prove new longs, new shorts or future direction on their own.</p></div></div>
+            <div class="metric-grid"><div class="metric-card"><span>Open interest</span><b id="oi-value">—</b><small id="oi-age">Waiting</small></div><div class="metric-card"><span>Funding rate</span><b id="funding-value">—</b><small id="funding-state">Waiting</small></div><div class="metric-card"><span>Mark price</span><b id="mark-value">—</b><small>Binance Futures</small></div><div class="metric-card"><span>Positioning</span><b id="positioning-value">—</b><small id="positioning-detail">Public ratio feed</small></div></div>
+            <div class="two-column"><section class="card derivative-card"><div class="card-head"><div><span class="eyebrow">POSITIONING</span><h2>Long / short context</h2></div><span class="feed-status" id="ratio-status">WAITING</span></div><div class="ratio-bar"><span id="long-bar"></span><span id="short-bar"></span></div><div class="ratio-labels"><b class="buy-text" id="long-ratio">Long —</b><b class="sell-text" id="short-ratio">Short —</b></div><div class="data-note">Public account ratios are crowd positioning, not executed flow.</div></section><section class="card derivative-card"><div class="card-head"><div><span class="eyebrow">BASIS & RISK</span><h2>Market context</h2></div></div><div class="context-list"><div><span>Index / mark spread</span><b id="basis-value">—</b></div><div><span>Funding regime</span><b id="funding-regime">—</b></div><div><span>Liquidation source</span><b class="warning-text">UNAVAILABLE</b></div><div><span>Options surface</span><b class="warning-text">NOT CONNECTED</b></div></div></section></div>
+          </div>
+
+          <div class="view-panel" id="view-context">
+            <div class="view-heading"><div><span class="eyebrow">CONTEXT WORKSPACE</span><h1>Market regime and external context</h1><p>Macro and news are context only. They never override execution evidence.</p></div></div>
+            <div class="two-column"><section class="card context-card"><div class="card-head"><div><span class="eyebrow">REGIME</span><h2>What is measured now?</h2></div><span class="pill neutral">RESEARCH ONLY</span></div><div class="regime-list"><div><span>Execution flow</span><b id="context-flow">WAITING</b></div><div><span>Displayed liquidity</span><b id="context-book">WAITING</b></div><div><span>Market structure</span><b id="context-structure">WAITING</b></div><div><span>Historical calibration</span><b class="warning-text">UNAVAILABLE</b></div></div></section><section class="card context-card"><div class="card-head"><div><span class="eyebrow">MACRO / NEWS</span><h2>External feed</h2></div><span class="feed-status warning-text">NOT CONNECTED</span></div><div class="unavailable-box"><div class="big-warning">!</div><div><b>Context feed unavailable</b><span>News, macro and on-chain data are not used in the live decision gate. Connect and timestamp them before relying on this workspace.</span></div></div></section></div>
+          </div>
+
+          <div class="view-panel" id="view-health">
+            <div class="view-heading"><div><span class="eyebrow">DATA HEALTH</span><h1>Feed integrity and freshness</h1><p>Any invalid or stale critical feed suppresses decision authorization.</p></div><span class="pill" id="health-pill">CONNECTING</span></div>
+            <div class="health-grid" id="health-grid"></div>
+            <section class="card health-log-card"><div class="card-head"><div><span class="eyebrow">EVENT LOG</span><h2>System events</h2></div><button class="text-btn" id="clear-log">Clear</button></div><div id="health-log" class="health-log"></div></section>
+          </div>
+        </main>
+      </div>
+      <footer class="statusbar"><span>Codexin Order Flow · v0.1.0</span><span id="footer-status">Initializing validated USD-M Futures feeds…</span><span>Last event <b id="footer-event-age">—</b></span></footer>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>
