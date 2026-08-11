@@ -114,6 +114,7 @@ async def calibration() -> dict[str, Any]:
 
 
 @app.get("/metrics")
+@app.get("/api/v1/metrics")
 async def metrics() -> Response:
     state = collector.state; health = collector.health(); intelligence = state.intelligence; values = {"codexin_trade_count": state.trade_count, "codexin_orderbook_resync_total": state.orderbook.resync_count, "codexin_raw_events_dropped_total": store.dropped, "codexin_ws_reconnect_total": collector.reconnects, "depth_events_sec": len([timestamp for timestamp in intelligence.depth_event_times if now_ms() - timestamp <= 1000]), "tracked_walls": len(intelligence.walls), "detector_latency_ms": round(intelligence.last_latency_ms, 3), "sequence_resync_count": state.orderbook.resync_count, "trade_depth_reconciliation_error": round(intelligence.reconciliation_error(), 6), "probability_model_status": 0, "codexin_base_levels": len(intelligence.levels)}
     body = "\n".join(f"{key} {value}" for key, value in values.items()) + "\n" + f'codexin_decision_authorized {1 if health["decision_authorized"] else 0}\n'
