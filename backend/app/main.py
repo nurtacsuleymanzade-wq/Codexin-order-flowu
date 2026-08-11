@@ -10,6 +10,7 @@ from .collector import BinanceCollector
 from .config import settings
 from .contracts import unavailable_probability
 from .store import EventStore
+from .core import now_ms
 
 
 store = EventStore(settings.raw_dir, settings.redis_url, settings.clickhouse_url)
@@ -23,7 +24,7 @@ async def lifespan(_: FastAPI):
     await collector.stop()
 
 
-app = FastAPI(title="Codexin Order Flow API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Codexin Order Flow API", version="0.4.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins), allow_methods=["GET"], allow_headers=["*"])
 
 
@@ -56,17 +57,32 @@ async def data_health() -> dict[str, Any]:
 async def snapshot(symbol: str) -> dict[str, Any]:
     if symbol.upper() != settings.symbol:
         raise HTTPException(status_code=404, detail="Only configured symbol is available")
-    payload = collector.state.snapshot(); payload["health"] = collector.health(); return payload
+    health = collector.health()
+    trusted = health["feeds"]["orderbook"]["status"] == "LIVE" and health["feeds"]["trades"]["status"] == "LIVE"
+    payload = collector.state.snapshot(intelligence_trusted=trusted); payload["health"] = health; return payload
 
 
 @app.get("/api/v1/orderbook/live")
 async def live_orderbook() -> dict[str, Any]:
-    state = collector.state; return {"status": collector.health()["feeds"]["orderbook"]["status"], "symbol": settings.symbol, "market": "USD_M_FUTURES", "book": state.orderbook.metrics(), "received_at": state.orderbook.last_event_at}
+    state = collector.state; health = collector.health(); trusted = health["feeds"]["orderbook"]["status"] == "LIVE" and health["feeds"]["trades"]["status"] == "LIVE"; return {"status": health["feeds"]["orderbook"]["status"], "symbol": settings.symbol, "market": "USD_M_FUTURES", "book": state.orderbook.metrics(), "intelligence": state.intelligence.snapshot(state.orderbook, list(state.klines), list(state.buckets.values()), state.price, now_ms(), data_integrity_ok=trusted), "received_at": state.orderbook.last_event_at}
+
+
+@app.get("/api/v1/orderbook/intelligence")
+@app.get("/api/orderbook/intelligence")
+async def orderbook_intelligence(timeframe: str = Query("1m", pattern=r"^(1m|5m|15m|1h)$")) -> dict[str, Any]:
+    state = collector.state
+    health = collector.health()
+    trusted = health["feeds"]["orderbook"]["status"] == "LIVE" and health["feeds"]["trades"]["status"] == "LIVE"
+    intelligence = state.intelligence.snapshot(state.orderbook, list(state.klines), list(state.buckets.values()), state.price, now_ms(), timeframe, data_integrity_ok=trusted)
+    intelligence["health"] = health
+    intelligence["symbol"] = settings.symbol
+    intelligence["source"] = "BINANCE_FUTURES_DEPTH+TRADE+BOOKTICKER+MARK_PRICE"
+    return intelligence
 
 
 @app.get("/api/v1/flow/summary")
 async def flow_summary(tf: str = Query("5m", pattern=r"^(1m|5m|15m|1h)$")) -> dict[str, Any]:
-    state = collector.state; return {"status": "LIVE" if state.last_trade_at else "STALE", "timeframe": tf, "symbol": settings.symbol, "source": "BINANCE_FUTURES_TRADE", "cvd": state.cvd, "vwap": state.vwap_pv / state.vwap_notional if state.vwap_notional else None, "trade_count": state.trade_count, "buckets": list(state.buckets.values())[-30:], "data_age_ms": state.age(state.last_trade_at)}
+    state = collector.state; indicators = state.intelligence.indicators(list(state.klines), list(state.buckets.values()), tf); return {"status": "LIVE" if state.last_trade_at else "STALE", "timeframe": tf, "symbol": settings.symbol, "source": "BINANCE_FUTURES_TRADE", "cvd": state.cvd, "vwap": state.vwap_pv / state.vwap_notional if state.vwap_notional else None, "trade_count": state.trade_count, "buckets": list(state.buckets.values())[-500:], "indicators": indicators, "data_age_ms": state.age(state.last_trade_at)}
 
 
 @app.get("/api/v1/capital-flow/summary")
@@ -93,11 +109,12 @@ async def probability_map(tf: str = Query("5m")) -> dict[str, Any]:
 
 @app.get("/api/v1/research/calibration")
 async def calibration() -> dict[str, Any]:
-    return {"status": "UNAVAILABLE", "calibration_status": "NOT_VERIFIED", "sample_size": 0, "oos_status": "NOT_RUN", "brier_score": None, "log_loss": None, "reason": "Immutable history, labels, fees and slippage model are required"}
+    summary = collector.state.intelligence.outcomes.summary()
+    return {"status": "COLLECTING_LABELS", "calibration_status": "NOT_VERIFIED", **summary, "reason": "Live labels are archived, but a versioned replay dataset and out-of-sample calibration are still required before probabilities can be published"}
 
 
 @app.get("/metrics")
 async def metrics() -> Response:
-    state = collector.state; health = collector.health(); values = {"codexin_trade_count": state.trade_count, "codexin_orderbook_resync_total": state.orderbook.resync_count, "codexin_raw_events_dropped_total": store.dropped, "codexin_ws_reconnect_total": collector.reconnects}
+    state = collector.state; health = collector.health(); intelligence = state.intelligence; values = {"codexin_trade_count": state.trade_count, "codexin_orderbook_resync_total": state.orderbook.resync_count, "codexin_raw_events_dropped_total": store.dropped, "codexin_ws_reconnect_total": collector.reconnects, "depth_events_sec": len([timestamp for timestamp in intelligence.depth_event_times if now_ms() - timestamp <= 1000]), "tracked_walls": len(intelligence.walls), "detector_latency_ms": round(intelligence.last_latency_ms, 3), "sequence_resync_count": state.orderbook.resync_count, "trade_depth_reconciliation_error": round(intelligence.reconciliation_error(), 6), "probability_model_status": 0, "codexin_base_levels": len(intelligence.levels)}
     body = "\n".join(f"{key} {value}" for key, value in values.items()) + "\n" + f'codexin_decision_authorized {1 if health["decision_authorized"] else 0}\n'
     return Response(content=body, media_type="text/plain; version=0.0.4")

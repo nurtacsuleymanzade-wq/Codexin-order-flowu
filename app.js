@@ -23,14 +23,15 @@ const state = {
   lastOiAt: 0, lastFundingAt: 0, lastRatioAt: 0, lastMarkAt: 0, lastLiquidationAt: 0,
   lastWsAt: 0, liquidationConnectedAt: 0, tradeCount: 0, errors: 0,
   cvd: 0, vwapPV: 0, vwapVolume: 0, events: [], trades: [],
-  liquidations: [], buckets: new Map(), profile: new Map(), klines: [],
+  liquidations: [], buckets: new Map(), profile: new Map(), klines: [], baseKlines: [], intelligence: null,
   lifecycle: new Map(), lastBookSyncAt: 0, lastDepthEventAt: 0,
   lastBookEventTime: 0, lastTickerEventTime: 0,
   aggression: { buy: 0, sell: 0, count: 0, volume: 0 },
   book: { bids: new Map(), asks: new Map(), lastUpdateId: null, lastEventId: null,
     valid: false, resyncs: 0, queue: [], syncing: false, renderQueued: false },
   ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, directFallbackStarted: false, chart: null, candleSeries: null,
-  volumeSeries: null
+  volumeSeries: null, vwapSeries: null, chartPriceLines: [],
+  visibleIndicators: new Set(["vwap", "volume", "cvd", "structure", "detectors"])
 };
 
 const $ = id => document.getElementById(id);
@@ -38,6 +39,17 @@ const fmt = (n, d = 2) => Number.isFinite(Number(n)) ? Number(n).toLocaleString(
 const usd = n => Number.isFinite(Number(n)) ? `$${fmt(n, 0)}` : "—";
 const ago = t => t ? ((Date.now() - t) / 1000 < 10 ? `${Math.max(0, (Date.now() - t) / 1000).toFixed(1)}s` : `${Math.round((Date.now() - t) / 1000)}s`) : "—";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[c]));
+const timeframeMs = interval => ({ "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000 }[interval] || 60000);
+const scoreBand = value => Number(value) >= 70 ? "HIGH" : Number(value) >= 45 ? "MEDIUM" : "LOW";
+
+function selectedFlow() {
+  const duration = timeframeMs(state.interval), rows = [...state.buckets.values()];
+  if (!rows.length) return { buy: 0, sell: 0, delta: null, count: 0, start: null };
+  const latest = Math.max(...rows.map(row => Number(row.time))), start = Math.floor(latest / duration) * duration;
+  const selected = rows.filter(row => Number(row.time) >= start && Number(row.time) < start + duration);
+  const buy = selected.reduce((sum, row) => sum + Number(row.buy || 0), 0), sell = selected.reduce((sum, row) => sum + Number(row.sell || 0), 0);
+  return { buy, sell, delta: buy - sell, count: selected.reduce((sum, row) => sum + Number(row.count || 0), 0), start };
+}
 
 function log(message, kind = "info") {
   state.events.unshift({ time: new Date(), message, kind });
@@ -72,7 +84,8 @@ async function pollBackendSnapshot() {
     state.price = price.last ?? state.price; state.mark = price.mark ?? state.mark; state.index = price.index ?? state.index; state.cvd = Number(flow.cvd || 0); state.vwapPV = Number(flow.vwap || 0); state.vwapVolume = flow.vwap ? 1 : 0; state.tradeCount = Number(flow.trade_count || 0);
     state.oi = derivatives.open_interest ?? state.oi; state.funding = derivatives.funding_rate ?? state.funding; state.ratios = derivatives.positioning ?? state.ratios;
     state.buckets = new Map((flow.buckets || []).map(bucket => [Number(bucket.time), bucket]));
-    state.klines = (snapshot.candles?.rows || []).map(row => ({ time: Number(row.time), open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), volume: Number(row.volume), closed: Boolean(row.closed) }));
+    state.intelligence = snapshot.intelligence || state.intelligence;
+    if (state.interval === "1m") state.klines = (snapshot.candles?.rows || []).map(row => ({ time: Number(row.time), open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), volume: Number(row.volume), closed: Boolean(row.closed) }));
     state.liquidations = snapshot.liquidations?.recent || [];
     if (orderbook.bids && orderbook.asks) {
       const nextBids = orderbook.bids.map(row => [String(row.price), Number(row.quantity)]), nextAsks = orderbook.asks.map(row => [String(row.price), Number(row.quantity)]);
@@ -294,7 +307,7 @@ function onKline(event) {
   state.lastKlineAt = Date.now();
   const index = state.klines.findIndex(rowItem => rowItem.time === row.time);
   if (index >= 0) state.klines[index] = row; else state.klines.push(row);
-  state.klines = state.klines.slice(-500); renderChart(); renderHeader();
+  state.klines = state.klines.slice(-500); if (state.interval === "1m") state.baseKlines = state.klines.slice(); renderChart(); renderHeader();
 }
 
 function onBookTicker(event) {
@@ -307,20 +320,20 @@ function onBookTicker(event) {
 async function loadHistory() {
   try {
     const rows = await json(`${CONFIG.rest}/klines?symbol=${CONFIG.symbol}&interval=1m&limit=500`);
-    state.klines = rows.filter(row => Number(row[6]) < Date.now()).map(row => ({ time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[7]), closed: true }));
+    state.klines = rows.filter(row => Number(row[6]) < Date.now()).map(row => ({ time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[7]), closed: true })); state.baseKlines = state.klines.slice();
     state.prevClose = state.klines.at(-2)?.close || null; renderChart(); log(`Loaded ${state.klines.length} closed Futures candles`, "good");
   } catch (error) { state.errors += 1; log(`Kline history unavailable: ${error.message}`, "warn"); }
 }
 
 async function pollKline() {
   try {
-    const rows = await json(`${CONFIG.rest}/klines?symbol=${CONFIG.symbol}&interval=1m&limit=2`, { timeout: 5000 });
+    const rows = await json(`${CONFIG.rest}/klines?symbol=${CONFIG.symbol}&interval=${state.interval}&limit=2`, { timeout: 5000 });
     for (const row of rows) {
       const item = { time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[7]), closed: Number(row[6]) < Date.now() };
       const index = state.klines.findIndex(existing => existing.time === item.time);
       if (index >= 0) state.klines[index] = item; else state.klines.push(item);
     }
-    state.klines = state.klines.slice(-500); state.lastKlineAt = Date.now(); renderChart(); renderHeader();
+    state.klines = state.klines.slice(-500); if (state.interval === "1m") state.baseKlines = state.klines.slice(); state.lastKlineAt = Date.now(); renderChart(); renderHeader();
   } catch (error) { log(`Live kline poll unavailable: ${error.message}`, "warn"); }
 }
 
@@ -364,9 +377,9 @@ function renderHeader() {
   setText("last-price", usd(state.price));
   const change = state.prevClose && state.price ? (state.price - state.prevClose) / state.prevClose * 100 : null;
   setText("price-change", change == null ? "—" : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`); setClass("price-change", change == null ? "neutral" : change >= 0 ? "up-text" : "down-text");
-  const bucket = [...state.buckets.values()].at(-1), delta = bucket ? bucket.buy - bucket.sell : null, metrics = bookMetrics();
-  setText("delta-value", delta == null ? "—" : usd(delta)); setClass("delta-value", delta == null ? "neutral" : delta >= 0 ? "up-text" : "down-text");
-  setText("delta-detail", bucket ? `${bucket.count.toLocaleString()} executions · ${new Date(bucket.time).toISOString().slice(11, 16)} UTC` : "No closed bucket yet");
+  const flow = selectedFlow(), delta = flow.delta, metrics = bookMetrics();
+  setText("delta-label", `${state.interval.toUpperCase()} DELTA`); setText("delta-value", delta == null ? "—" : usd(delta)); setClass("delta-value", delta == null ? "neutral" : delta >= 0 ? "up-text" : "down-text");
+  setText("delta-detail", flow.start == null ? "No execution bucket yet" : `${flow.count.toLocaleString()} executions · ${new Date(flow.start).toISOString().slice(11, 16)} UTC`);
   setText("book-imbalance", metrics.valid ? `${metrics.imbalance >= 0 ? "+" : ""}${metrics.imbalance.toFixed(1)}%` : "—"); setClass("book-imbalance", metrics.imbalance > 0 ? "up-text" : metrics.imbalance < 0 ? "down-text" : "neutral");
   setText("book-detail", metrics.valid ? `${metrics.bidShare.toFixed(1)}% bid / ${metrics.askShare.toFixed(1)}% ask` : "Order book syncing");
   setText("data-age", ago(Math.max(state.lastTradeAt, state.lastBookAt))); setText("data-age-detail", state.lastTradeAt ? `Last trade ${ago(state.lastTradeAt)} ago` : "No tick received");
@@ -381,7 +394,13 @@ function renderBook() {
   const metrics = bookMetrics(); if (!metrics.valid) { setText("book-age", "Age —"); return; }
   const rows = [...metrics.asks.slice(0, CONFIG.bookLevels).reverse().map(row => ({ ...row, side: "ask" })), { p: metrics.mid, q: null, side: "mid" }, ...metrics.bids.slice(0, CONFIG.bookLevels).map(row => ({ ...row, side: "bid" }))];
   const max = Math.max(...rows.filter(row => row.q).map(row => row.q), 1);
-  $("orderbook").innerHTML = rows.map(row => row.side === "mid" ? `<div class="book-row mid-row"><span></span><span class="price">${fmt(row.p)}</span><span></span></div>` : `<div class="book-row ${row.side}"><span class="price">${fmt(row.p)}</span><span></span><span class="qty">${fmt(row.q, 3)}</span><i class="depth-fill" style="width:${Math.min(100, row.q / max * 100)}%"></i></div>`).join("");
+  const walls = (state.intelligence?.walls || []).filter(wall => wall.visible), wallAt = row => walls.find(wall => wall.side === (row.side === "ask" ? "ASK" : "BID") && Math.abs(Number(wall.price) - row.p) < .00001);
+  $("orderbook").innerHTML = rows.map(row => {
+    if (row.side === "mid") return `<div class="book-row mid-row"><span></span><span class="price">${fmt(row.p)}</span><span></span></div>`;
+    const wall = wallAt(row), tooltip = wall ? `Role ${wall.role} · persistence ${fmt(wall.persistence_score, 0)}/100 · pull ${fmt(wall.pull_score, 0)}/100 · replenishment ${fmt(wall.replenishment_score, 0)}/100 · executed ${fmt(wall.executed_qty, 2)} BTC · effective ${fmt(wall.effective_qty, 2)} BTC · all scores are heuristic` : "";
+    const badge = wall ? `<span class="wall-intent ${Number(wall.pull_score) >= 70 ? "risk" : Number(wall.real_liquidity_score) >= 60 ? "real" : "watch"}" title="${esc(tooltip)}">${esc(String(wall.role || "WALL").replaceAll("_", " ").slice(0, 12))}</span>` : `<span></span>`;
+    return `<div class="book-row ${row.side}"><span class="price">${fmt(row.p)}</span>${badge}<span class="qty">${fmt(row.q, 3)}</span><i class="depth-fill" style="width:${Math.min(100, row.q / max * 100)}%"></i></div>`;
+  }).join("");
   setText("bid-total", usd(metrics.bid10)); setText("ask-total", usd(metrics.ask10)); setText("book-sequence", `Sequence ${state.book.lastUpdateId || "—"}`); setText("book-age", `Age ${ago(state.lastBookAt)}`); renderLiquidity(metrics);
 }
 
@@ -395,8 +414,16 @@ function renderLiquidity(metrics = bookMetrics()) {
   setText("liq-bid-notional", usd(metrics.bid10)); setText("liq-ask-notional", usd(metrics.ask10)); setText("liq-bid-share", `${metrics.bidShare.toFixed(1)}% of ±10bps displayed book`); setText("liq-ask-share", `${metrics.askShare.toFixed(1)}% of ±10bps displayed book`);
   const zones = estimatedZones(); setText("liq-nearest", zones[0] ? usd(zones[0].price) : "—");
   $("liquidity-bars").innerHTML = zones.length ? zones.map(zone => `<div class="liq-zone"><span class="zone-price">${usd(zone.price)}</span><span class="zone-bar" style="width:${Math.max(8, zone.size / zones[0].size * 100)}%"></span><span class="zone-size">${fmt(zone.size, 0)} BTC</span></div>`).join("") : `<div class="empty-state">Waiting for OI and mark price</div>`;
-  const large = [...metrics.asks.slice(0, 20), ...metrics.bids.slice(0, 20)].filter(row => row.p * row.q > 250000).sort((a, b) => b.p * b.q - a.p * a.q).slice(0, 12);
-  $("large-orders-table").innerHTML = large.length ? large.map(row => { const life = lifecycleFor(row, row.p > metrics.mid ? "ask" : "bid"), lifetime = (Date.now() - Number(life.firstSeen || Date.now())) / 1000, pulledRatio = Number(life.pulledQuantity || 0) / Math.max(Number(life.removedQuantity || 0), 1), refillRatio = Number(life.replenishedQuantity || 0) / Math.max(Number(life.addedQuantity || 0), 1), status = pulledRatio > .7 && lifetime < 10 ? "SPOOF WATCH" : refillRatio > .25 ? "REPLENISHING WALL" : lifetime > 8 ? "PERSISTENT WALL" : "UNCONFIRMED"; return `<tr><td class="${row.p > metrics.mid ? "sell-text" : "buy-text"}">${row.p > metrics.mid ? "ASK" : "BID"}</td><td>${usd(row.p)}</td><td>${usd(row.p * row.q)}</td><td>${((row.p - metrics.mid) / metrics.mid * 10000).toFixed(1)} bp</td><td>${lifetime.toFixed(1)}s</td><td class="warning-text">${status}<br><span class="muted-cell">lifetime ${lifetime.toFixed(1)}s · pulled ${(pulledRatio * 100).toFixed(0)}% · refill ${(refillRatio * 100).toFixed(0)}% · price reaction UNAVAILABLE</span></td></tr>`; }).join("") : `<tr><td colspan="6" class="empty-state">No large validated resting orders in current range</td></tr>`;
+  const backendWalls = (state.intelligence?.walls || []).filter(wall => wall.visible).sort((a, b) => Number(b.importance_score || 0) - Number(a.importance_score || 0)).slice(0, 30);
+  if (backendWalls.length) {
+    $("large-orders-table").innerHTML = backendWalls.map(wall => {
+      const sideClass = wall.side === "BID" ? "buy-text" : "sell-text", scoreTip = "0–100 heuristic evidence rank; not probability", effectiveTip = "Displayed × pull adjustment × replenishment adjustment × persistence adjustment; uncalibrated estimate";
+      return `<tr><td class="${sideClass}"><b>${esc(wall.side)}</b><br>${usd(wall.price)}</td><td title="${effectiveTip}">${fmt(wall.displayed_qty,2)} / ~${fmt(wall.effective_qty,2)} BTC</td><td>${esc(wall.tracking_zone)} · ${fmt(Math.abs(Number(wall.distance_atr)),2)} ATR</td><td title="${scoreTip}">${fmt(wall.lifetime_sec,1)}s · ${fmt(wall.persistence_score,0)}/100</td><td title="Trade-depth reconciliation: executed / cancellation estimate / unknown">${fmt(wall.executed_qty,2)} / ${fmt(wall.cancelled_qty,2)} / ${fmt(wall.unknown_removed_qty,2)}</td><td title="Pull ratio ${fmt(Number(wall.pull_ratio) * 100,1)}% · ${scoreTip}" class="${Number(wall.pull_score) >= 70 ? "warning-text" : ""}">${fmt(wall.pull_score,0)}/100</td><td title="${scoreTip}">${fmt(wall.replenishment_score,0)}/100 · ${wall.replenishment_count || 0}×</td><td title="Absorption and iceberg-like are behavioural scores, not probabilities">${fmt(wall.absorption_score,0)} / ${fmt(wall.iceberg_score,0)}</td><td><span class="role-chip">${esc(String(wall.role || "UNCERTAIN").replaceAll("_", " "))}</span><br><span class="muted-cell">confidence ${fmt(Number(wall.confidence) * 100,0)}%</span></td></tr>`;
+    }).join("");
+  } else {
+    const large = [...metrics.asks.slice(0, 20), ...metrics.bids.slice(0, 20)].filter(row => row.p * row.q > 250000).sort((a, b) => b.p * b.q - a.p * a.q).slice(0, 12);
+    $("large-orders-table").innerHTML = large.length ? large.map(row => `<tr><td class="${row.p > metrics.mid ? "sell-text" : "buy-text"}">${row.p > metrics.mid ? "ASK" : "BID"}<br>${usd(row.p)}</td><td>${fmt(row.q,2)} / — BTC</td><td>— · ${fmt(Math.abs(row.p - metrics.mid) / metrics.mid * 10000,1)} bp</td><td colspan="6" class="muted-cell">Browser fallback: lifecycle intelligence requires validated backend feed</td></tr>`).join("") : `<tr><td colspan="9" class="empty-state">No tracked liquidity wall in the validated range</td></tr>`;
+  }
 }
 
 function renderLiquidations() {
@@ -415,11 +442,88 @@ function renderFlow() {
   $("footprint").innerHTML = rows.map(row => { const delta = row.buy - row.sell; return `<div class="flow-row"><span class="time">${new Date(row.time).toISOString().slice(11, 16)}</span><span><i class="bar buy-bar" style="width:${Math.max(3, row.buy / max * 100)}%"></i></span><span><i class="bar sell-bar" style="width:${Math.max(3, row.sell / max * 100)}%"></i></span><span class="flow-num ${delta >= 0 ? "buy-text" : "sell-text"}">${delta >= 0 ? "+" : ""}${usd(delta)}</span></div>`; }).join("") || `<div class="empty-state">Waiting for closed 1m buckets</div>`;
 }
 
+function emaValues(values, period) {
+  if (!values.length) return [];
+  const alpha = 2 / (period + 1), output = [values[0]];
+  for (let index = 1; index < values.length; index += 1) output.push(values[index] * alpha + output[index - 1] * (1 - alpha));
+  return output;
+}
+
+function chartAnalytics() {
+  const rows = state.klines, closes = rows.map(row => row.close), fast = emaValues(closes, 12), slow = emaValues(closes, 26), macd = closes.map((_, index) => fast[index] - slow[index]), signal = emaValues(macd, 9);
+  const rsi = new Array(rows.length).fill(null), period = 14;
+  for (let index = period; index < rows.length; index += 1) {
+    let gains = 0, losses = 0;
+    for (let cursor = index - period + 1; cursor <= index; cursor += 1) { const change = closes[cursor] - closes[cursor - 1]; gains += Math.max(change, 0); losses += Math.max(-change, 0); }
+    const avgGain = gains / period, avgLoss = losses / period; rsi[index] = avgLoss ? 100 - 100 / (1 + avgGain / avgLoss) : avgGain ? 100 : 50;
+  }
+  let cumulativePV = 0, cumulativeVolume = 0;
+  const vwap = rows.map(row => { cumulativePV += ((row.high + row.low + row.close) / 3) * row.volume; cumulativeVolume += row.volume; return { time: row.time, value: cumulativePV / Math.max(cumulativeVolume, 1e-9) }; });
+  const duration = timeframeMs(state.interval), deltas = new Map();
+  [...state.buckets.values()].forEach(bucket => { const key = Math.floor(Number(bucket.time) / duration) * duration / 1000; deltas.set(key, (deltas.get(key) || 0) + Number(bucket.buy || 0) - Number(bucket.sell || 0)); });
+  let cvd = 0; const cvdSeries = rows.map(row => { cvd += deltas.get(Number(row.time)) || 0; return cvd; });
+  return { vwap, rsi, macd, signal, histogram: macd.map((value, index) => value - signal[index]), cvd: cvdSeries };
+}
+
+function drawIndicatorCanvas(analytics) {
+  const panel = document.querySelector(".indicator-panel"), canvas = $("indicator-canvas"), active = ["cvd", "rsi", "macd"].filter(name => state.visibleIndicators.has(name));
+  if (!canvas || !panel) return;
+  panel.hidden = !active.length; if (!active.length) return;
+  const width = Math.max(panel.clientWidth, 320), height = 150, ratio = window.devicePixelRatio || 1; canvas.width = width * ratio; canvas.height = height * ratio; canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  const context = canvas.getContext("2d"); context.scale(ratio, ratio); context.clearRect(0, 0, width, height); context.strokeStyle = "#18334a"; context.lineWidth = 1;
+  for (let line = 1; line < 4; line += 1) { context.beginPath(); context.moveTo(0, line * height / 4); context.lineTo(width, line * height / 4); context.stroke(); }
+  const slice = Math.max(0, state.klines.length - 180), plot = (values, color, fixedRange = null) => {
+    const data = values.slice(slice).map(Number).filter(Number.isFinite); if (data.length < 2) return;
+    const min = fixedRange ? fixedRange[0] : Math.min(...data), max = fixedRange ? fixedRange[1] : Math.max(...data); context.strokeStyle = color; context.lineWidth = 1.4; context.beginPath();
+    values.slice(slice).forEach((raw, index) => { const value = Number(raw); if (!Number.isFinite(value)) return; const x = index / Math.max(values.slice(slice).length - 1, 1) * width, y = height - (value - min) / Math.max(max - min, 1e-9) * height; if (index === 0) context.moveTo(x, y); else context.lineTo(x, y); }); context.stroke();
+  };
+  if (state.visibleIndicators.has("cvd")) plot(analytics.cvd, "#b89cff");
+  if (state.visibleIndicators.has("rsi")) plot(analytics.rsi, "#f7c968", [0, 100]);
+  if (state.visibleIndicators.has("macd")) { plot(analytics.macd, "#5ed7ff"); plot(analytics.signal, "#ff7c93"); }
+  $("indicator-legend").innerHTML = active.map(name => `<span class="${name}">${name.toUpperCase()} ${name === "rsi" ? fmt(analytics.rsi.at(-1),1) : name === "macd" ? fmt(analytics.macd.at(-1),2) : usd(analytics.cvd.at(-1))}</span>`).join("");
+}
+
+function clearChartAnnotations() {
+  for (const line of state.chartPriceLines) try { state.candleSeries.removePriceLine(line); } catch { /* chart may be rebuilding */ }
+  state.chartPriceLines = [];
+}
+
+function addChartLine(price, title, color, style = 2) {
+  if (!Number.isFinite(Number(price))) return;
+  state.chartPriceLines.push(state.candleSeries.createPriceLine({ price: Number(price), color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title }));
+}
+
+function renderProfileOverlay() {
+  const host = $("price-chart"); if (!host) return;
+  let overlay = $("profile-overlay"); if (!overlay) { overlay = document.createElement("div"); overlay.id = "profile-overlay"; overlay.className = "profile-overlay"; host.appendChild(overlay); }
+  const showVolume = state.visibleIndicators.has("volumeProfile"), showTpo = state.visibleIndicators.has("tpo");
+  if (!showVolume && !showTpo) { overlay.hidden = true; return; }
+  const profile = state.intelligence?.profiles || {}, rows = (showTpo ? profile.tpo_rows : profile.rows) || [], field = showTpo ? "tpo" : "volume", selected = rows.slice(-28), max = Math.max(...selected.map(row => Number(row[field] || 0)), 1);
+  const body = selected.reverse().map(row => `<div title="${usd(row.price)} · ${fmt(row[field], 0)}"><i style="width:${Math.max(4, Number(row[field] || 0) / max * 100)}%"></i><span>${fmt(row.price,0)}</span></div>`).join("") || `<small>profile sample unavailable</small>`;
+  overlay.hidden = false; overlay.innerHTML = `<b>${showTpo ? "TPO" : "VOLUME PROFILE"}</b>${body}`;
+}
+
+function renderChartOverlays(analytics) {
+  state.vwapSeries?.setData(state.visibleIndicators.has("vwap") ? analytics.vwap : []);
+  state.volumeSeries?.applyOptions({ visible: state.visibleIndicators.has("volume") });
+  clearChartAnnotations();
+  const intelligence = state.intelligence || {}, profile = intelligence.profiles || {}, structure = intelligence.structure || {};
+  if (state.visibleIndicators.has("valueArea")) { addChartLine(profile.poc, "POC", "#f7c968", 0); addChartLine(profile.vah, "VAH", "#b89cff"); addChartLine(profile.val, "VAL", "#b89cff"); (profile.hvn || []).slice(0,2).forEach(row => addChartLine(row.price, "HVN", "#4fe39b", 3)); (profile.lvn || []).slice(0,2).forEach(row => addChartLine(row.price, "LVN", "#ff6f85", 3)); }
+  if (state.visibleIndicators.has("zones") && structure.dealing_range) { addChartLine(structure.dealing_range.high, "PREMIUM", "#ff6f85", 2); addChartLine(structure.dealing_range.equilibrium, "EQ", "#e9eef2", 0); addChartLine(structure.dealing_range.low, "DISCOUNT", "#4fe39b", 2); }
+  const markers = [];
+  if (state.visibleIndicators.has("structure")) (structure.events || []).forEach(event => { if (!event.time) return; const up = event.direction === "UP" || ["HH","HL"].includes(event.type); markers.push({ time: Number(event.time), position: up ? "belowBar" : "aboveBar", color: up ? "#4fe39b" : "#ff6f85", shape: up ? "arrowUp" : "arrowDown", text: event.alias ? `${event.type}/${event.alias}` : event.type }); });
+  if (state.visibleIndicators.has("detectors") && state.klines.length) { const detectors = intelligence.detectors || {}, last = state.klines.at(-1).time, absorb = Math.max(Number(detectors.absorption?.buy_absorption_score || 0), Number(detectors.absorption?.sell_absorption_score || 0)); if (absorb >= 60) markers.push({ time: last, position: "aboveBar", color: "#5ed7ff", shape: "circle", text: "ABS" }); if (Number(detectors.exhaustion?.score || 0) >= 65) markers.push({ time: last, position: "belowBar", color: "#f7c968", shape: "circle", text: "EXH" }); }
+  markers.sort((a, b) => Number(a.time) - Number(b.time)); state.candleSeries.setMarkers(markers);
+  renderProfileOverlay(); drawIndicatorCanvas(analytics);
+}
+
 function renderChart() {
   if (!state.chart || !state.candleSeries) return;
-  state.candleSeries.setData(state.klines.map(row => ({ time: row.time, open: row.open, high: row.high, low: row.low, close: row.close })));
-  state.volumeSeries?.setData(state.klines.map(row => ({ time: row.time, value: row.volume, color: row.close >= row.open ? "#4fe39b55" : "#ff6f8555" })));
-  setText("chart-last-update", `Last update ${ago(state.lastKlineAt)}`);
+  const rows = state.klines.filter(row => Number.isFinite(row.time) && Number.isFinite(row.close));
+  state.candleSeries.setData(rows.map(row => ({ time: row.time, open: row.open, high: row.high, low: row.low, close: row.close })));
+  state.volumeSeries?.setData(rows.map(row => ({ time: row.time, value: row.volume, color: row.close >= row.open ? "#4fe39b55" : "#ff6f8555" })));
+  const analytics = chartAnalytics(); renderChartOverlays(analytics);
+  setText("chart-last-update", `Last update ${ago(state.lastKlineAt)}`); setText("chart-data-note", `${state.interval.toUpperCase()} closed candles · ${state.intelligence?.probability_status || "scores uncalibrated"}`);
 }
 
 function initChart() {
@@ -428,6 +532,7 @@ function initChart() {
   state.chart = LightweightCharts.createChart(element, { layout: { background: { color: "transparent" }, textColor: "#7d98ad" }, grid: { vertLines: { color: "#142a40" }, horzLines: { color: "#142a40" } }, rightPriceScale: { borderColor: "#1d3953" }, timeScale: { borderColor: "#1d3953", timeVisible: true, secondsVisible: false }, crosshair: { mode: 1 }, width: element.clientWidth, height: 405 });
   state.candleSeries = state.chart.addCandlestickSeries({ upColor: "#4fe39b", downColor: "#ff6f85", borderVisible: false, wickUpColor: "#4fe39b", wickDownColor: "#ff6f85" });
   state.volumeSeries = state.chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "volume", scaleMargins: { top: .82, bottom: 0 }, color: "#4c8" });
+  state.vwapSeries = state.chart.addLineSeries({ color: "#5ed7ff", lineWidth: 2, priceLineVisible: false, lastValueVisible: true, title: "VWAP" });
   new ResizeObserver(() => state.chart?.applyOptions({ width: element.clientWidth })).observe(element); renderChart();
 }
 
@@ -554,6 +659,44 @@ function estimatedStopZones(metrics, clusters) {
   return { up, down };
 }
 
+function renderBackendIntelligence(metrics) {
+  const intel = state.intelligence, micro = intel.microstructure || {}, aggression = intel.aggression?.["1000ms"] || {}, targets = intel.targets || [], clusters = intel.clusters || [], interpretation = intel.interpretation || {};
+  setClass("intel-health-dot", "status-dot good"); setText("intel-health-label", "VALIDATED LIFECYCLE ENGINE · LIVE"); setText("intel-health-meta", `depth + trade + BBO · age ${ago(state.lastBookAt)} · sequence ${state.book.lastUpdateId || "—"}`); setText("intel-summary-status", "LIVE / TRUSTED");
+  setText("intel-current-price", usd(intel.current_price || state.price || metrics.mid)); setText("intel-price-context", `Mark ${usd(state.mark)} · Index ${usd(state.index)}`);
+  const obi = Number(micro.obi?.top10 || 0) * 100, pressureLabel = obi > 5 ? "BID" : obi < -5 ? "ASK" : "BALANCED";
+  setText("intel-pressure", pressureLabel); setText("intel-pressure-pill", pressureLabel); setText("intel-pressure-detail", `Top-10 OBI ${obi >= 0 ? "+" : ""}${fmt(obi,1)}% · microprice bias ${fmt(micro.microprice_bias_bps,2)} bp`); if ($("intel-pressure-fill")) $("intel-pressure-fill").style.left = `${Math.max(2, Math.min(98, 50 + obi / 2))}%`;
+  setText("intel-confirmation", intel.detectors?.interaction_state || "MIXED"); setClass("intel-confirmation", "pill neutral");
+  const askTarget = targets.find(target => target.side === "ASK"), bidTarget = targets.find(target => target.side === "BID"), base = Number(intel.current_price || state.price || metrics.mid);
+  const targetCard = (target, priceId, distanceId, liquidityId) => { setText(priceId, target ? usd(target.price) : "UNAVAILABLE"); setText(distanceId, target ? `Distance ${fmt(Math.abs(target.price - base),1)} USD · ${fmt(Math.abs(target.features?.distance_atr),2)} ATR` : "Distance —"); setText(liquidityId, target ? `Touch score ${fmt(target.touch_score,0)}/100 · break score ${fmt(target.break_score,0)}/100 · ${target.liquidity_path} path` : "No validated candidate"); };
+  targetCard(askTarget, "intel-short-zone", "intel-short-distance", "intel-short-liquidity"); targetCard(bidTarget, "intel-long-zone", "intel-long-distance", "intel-long-liquidity");
+  const metricsHtml = [["Microprice", usd(micro.microprice), `${fmt(micro.microprice_bias_bps,2)} bp vs mid`],["Agg buy / sell", `${fmt(aggression.buy_volume,2)} / ${fmt(aggression.sell_volume,2)} BTC`, "REAL · trade execution · 1s"],["Aggression", fmt(Number(aggression.imbalance || 0) * 100,1) + "%", `acceleration ${fmt(intel.aggression?.acceleration,3)}`],["OBI top 10", fmt(obi,1) + "%", `velocity ${fmt(micro.obi_velocity,3)}/s`],["Vacuum up/down", `${fmt(intel.detectors?.vacuum?.up,0)} / ${fmt(intel.detectors?.vacuum?.down,0)}`, "HEURISTIC SCORE"],["Walls", fmt(intel.performance?.tracked_walls,0), `${fmt(intel.tracking_zones?.HOT,0)} hot · ${fmt(intel.tracking_zones?.ACTIVE,0)} active`],["Reconcile error", fmt(Number(intel.performance?.trade_depth_reconciliation_error || 0) * 100,1) + "%", "unmatched depth removal"],["Latency", fmt(intel.performance?.detector_latency_ms,2) + " ms", "depth detector hot path"]];
+  $("intel-metrics").innerHTML = metricsHtml.map(([label,value,meta]) => `<div class="intel-metric"><span>${esc(label)}</span><b>${esc(value)}</b><small>${esc(meta)}</small></div>`).join("");
+  setText("intel-scenario-title", interpretation.state || intel.direction || "MIXED"); setText("intel-scenario-text", interpretation.message || "No single detector is used as a directional conclusion.");
+  const primary = targets[0];
+  $("intel-chain").innerHTML = [["Current state", intel.direction],["Interaction", intel.detectors?.interaction_state],["Path", primary ? `${primary.liquidity_path} · LRI ${fmt(primary.lri_score,0)}/100` : "No target"],["Target", primary ? usd(primary.price) : "—"],["Touch / break", primary ? `${fmt(primary.touch_score,0)} / ${fmt(primary.break_score,0)} scores` : "—"],["Invalidation", (interpretation.invalidation || [])[0] || "feed integrity"]].map(([label,value]) => `<div class="chain-step"><b>${esc(label)}</b>${esc(value || "—")}</div>`).join("");
+  $("intel-target").innerHTML = primary ? `<div class="target-grid"><div><span>TARGET</span><b>${usd(primary.price)}</b></div><div><span>TOUCH SCORE</span><b>${fmt(primary.touch_score,0)}/100</b></div><div><span>BREAK SCORE | TOUCH</span><b>${fmt(primary.break_score,0)}/100</b></div><div><span>TIME BUCKET</span><b>${esc(primary.estimated_time_bucket)}</b></div><div><span>PATH / LRI</span><b>${esc(primary.liquidity_path)} · ${fmt(primary.lri_score,0)}</b></div><div><span>PROBABILITY</span><b>UNCALIBRATED</b></div></div>` : `<div class="empty-state">No validated target candidate</div>`;
+  setText("intel-invalidation", primary ? `Touch and break are separate evidence scores. ${(interpretation.invalidation || []).join(" · ")}` : "No target · detector output remains measurement only.");
+  const bidShare = metrics.bidNotional / Math.max(metrics.bidNotional + metrics.askNotional, 1) * 100, askShare = 100 - bidShare;
+  $("orderbook-summary-table").innerHTML = [["BID",metrics.bidLevels,metrics.bidBtc,metrics.bidNotional,bidShare,metrics.bids[0]?.p],["ASK",metrics.askLevels,metrics.askBtc,metrics.askNotional,askShare,metrics.asks[0]?.p]].map(row => `<tr><td class="${row[0] === "BID" ? "buy-text" : "sell-text"}">${row[0]}</td><td>${fmt(row[1],0)}</td><td>${fmt(row[2],2)}</td><td>${usd(row[3])}</td><td>${fmt(row[4],1)}%</td><td>${usd(row[5])}</td><td colspan="2" class="muted-cell">Lifecycle below</td></tr>`).join("");
+  $("size-buckets-table").innerHTML = bucketSummaries(metrics).map(row => { const largest = Math.max(row.bid.largest?.q || 0,row.ask.largest?.q || 0); return `<tr><td>${row.label}</td><td>${row.bid.count}</td><td>${fmt(row.bid.btc,2)}</td><td>${usd(row.bid.notional)}</td><td>${row.ask.count}</td><td>${fmt(row.ask.btc,2)}</td><td>${usd(row.ask.notional)}</td><td>${fmt(row.dominance,1)}%</td><td>${fmt(row.bid.nearestBps ?? row.ask.nearestBps,1)} bp</td><td>${fmt(largest,2)} BTC</td><td colspan="2" class="muted-cell">Backend wall lifecycle is shown in Liquidity workspace</td></tr>`; }).join("");
+  $("clusters-table").innerHTML = clusters.slice(0,10).map(row => `<tr><td class="${row.side === "BID" ? "buy-text" : "sell-text"}">${esc(row.side)}</td><td>${usd(row.cluster_low)}–${usd(row.cluster_high)}</td><td>${fmt(Math.abs(row.distance),1)} USD · ${fmt(row.distance_atr,2)} ATR</td><td>${fmt(row.total_qty,2)}</td><td>${usd(Number(row.cluster_center) * Number(row.total_qty))}</td><td>${fmt(row.persistence,0)}/100</td><td>${fmt(row.absorption_score,0)} ABS · ${fmt(row.replenishment_score,0)} REP</td><td>${esc(row.status)}</td></tr>`).join("") || `<tr><td colspan="8" class="empty-state">No significant cluster in current snapshot</td></tr>`;
+}
+
+function renderBrief() {
+  const intel = state.intelligence, flow = selectedFlow(); setText("brief-price", usd(state.price)); setText("brief-delta", flow.delta == null ? "—" : `${state.interval.toUpperCase()} ${usd(flow.delta)}`);
+  if (!intel || intel.status !== "LIVE" || !intel.trusted) {
+    setText("engine-status", "SUPPRESSED"); setText("market-message", "Geçerli trade akışı ve sequence-valid order-book bekleniyor. Eski tahminler gösterilmiyor."); setText("brief-target", "—"); setText("brief-reason", "DATA INTEGRITY"); $("target-score-table").innerHTML = `<tr><td colspan="6" class="empty-state">Detector output suppressed</td></tr>`; return;
+  }
+  const target = intel.targets?.[0], detectors = intel.detectors || {}, interaction = detectors.interaction_state || "BALANCED / MIXED";
+  setText("engine-status", `LIVE · ${intel.probability_status}`); setText("brief-target", target ? usd(target.price) : "NO QUALIFIED TARGET"); setText("brief-reason", target ? `${interaction} · ${target.liquidity_path} PATH` : interaction);
+  const message = target ? `Şu an BTCUSDT ${usd(state.price)}. En yüksek kanıt skorlu hedef ${usd(target.price)}: ${interaction.replaceAll("_", " ")} ve ${target.liquidity_path.toLowerCase()} likidite yolu. Touch score ${fmt(target.touch_score,0)}/100, wall’a dokunulduktan sonraki break score ${fmt(target.break_score,0)}/100. Bunlar olasılık değildir.` : `Şu an BTCUSDT ${usd(state.price)}. Validated akış var, fakat anlamlı hedef eşiğini geçen liquidity seviyesi yok.`;
+  setText("market-message", message);
+  const outcomes = intel.calibration?.touch_outcomes?.["1m"] || {}, outcomeText = Number(outcomes.sample_size) ? `${outcomes.realized} realized / ${outcomes.missed} missed` : "INSUFFICIENT SAMPLE";
+  $("target-score-table").innerHTML = (intel.targets || []).slice(0,8).map(item => `<tr><td class="${item.side === "ASK" ? "sell-text" : "buy-text"}">${usd(item.price)} · ${esc(item.side)}</td><td title="Heuristic evidence rank, not probability">${fmt(item.touch_score,0)}/100</td><td title="Conditional-on-touch heuristic evidence rank">${fmt(item.break_score,0)}/100</td><td>${esc(item.estimated_time_bucket || "—")}</td><td>${esc(String(item.role || "UNCERTAIN").replaceAll("_", " "))}</td><td>${esc(outcomeText)}</td></tr>`).join("") || `<tr><td colspan="6" class="empty-state">No qualified target</td></tr>`;
+  const absorption = detectors.absorption || {}, replenish = detectors.replenishment || {}, spoof = detectors.spoof_like || {};
+  $("detector-grid").innerHTML = `<span title="Trade aggression + price response + surviving/replenishing depth">Buy absorption <b>${scoreBand(absorption.buy_absorption_score)} · ${fmt(absorption.buy_absorption_score,0)}</b></span><span>Sell absorption <b>${scoreBand(absorption.sell_absorption_score)} · ${fmt(absorption.sell_absorption_score,0)}</b></span><span>Exhaustion <b>${esc(detectors.exhaustion?.status || "LOW")} · ${fmt(detectors.exhaustion?.score,0)}</b></span><span>Trapped traders <b>${esc(detectors.trapped_traders?.status || "LOW")} · ${fmt(detectors.trapped_traders?.score,0)}</b></span><span title="Behaviour inference only; not manipulation proof">${esc(spoof.label || "SPOOF-LIKE LOW")} <b>${fmt(spoof.score,0)}</b></span><span>Replenishment <b>ASK ${fmt(replenish.ask_score,0)} · BID ${fmt(replenish.bid_score,0)}</b></span><span>Manipulation confirmation <b>UNAVAILABLE</b></span>`;
+}
+
 function renderIntelligence() {
   if (!$("intel-current-price")) return;
   const metrics = bookMetrics(), shell = $("intel-shell"), stale = !intelligenceFresh(metrics), now = Date.now();
@@ -563,6 +706,7 @@ function renderIntelligence() {
     ["intel-current-price","intel-short-zone","intel-long-zone","intel-pressure","intel-short-distance","intel-long-distance","intel-short-liquidity","intel-long-liquidity","intel-pressure-detail","intel-scenario-title","intel-scenario-text","intel-chain","intel-target","intel-invalidation"].forEach(id => setText(id, "—")); setText("intel-confirmation", "STALE"); setText("intel-pressure-pill", "STALE"); setClass("intel-confirmation", "pill warning"); setClass("intel-pressure-pill", "pill warning");
     $("orderbook-summary-table").innerHTML = `<tr><td colspan="8" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; $("size-buckets-table").innerHTML = `<tr><td colspan="12" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; $("clusters-table").innerHTML = `<tr><td colspan="8" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; return;
   }
+  if (state.intelligence?.status === "LIVE" && state.intelligence?.trusted) { renderBackendIntelligence(metrics); return; }
   const flow = recentFlow(), flowStats = flowIntelligence(flow), clusters = clusterSummaries(metrics), zones = estimatedStopZones(metrics, clusters), pressure = metrics.weightedImbalance, flowDelta = flowStats.delta, aligned = Math.sign(pressure) === Math.sign(flowDelta) && Math.abs(pressure) > 5 && flow.count > 0;
   setClass("intel-health-dot", "status-dot good"); setText("intel-health-label", "VALIDATED FEEDS · LIVE"); setText("intel-health-meta", `source BINANCE USD-M FUTURES · age ${ago(state.lastBookAt)} · sequence ${state.book.lastUpdateId || "—"}`); setText("intel-summary-status", "LIVE / OBSERVED");
   setText("intel-current-price", usd(state.price || metrics.mid)); setText("intel-price-context", `Mark ${usd(state.mark)} · Index ${usd(state.index)}`);
@@ -585,7 +729,7 @@ function renderIntelligence() {
   $("clusters-table").innerHTML = clusters.slice(0, 8).map(row => `<tr><td class="${row.side === "BID" ? "buy-text" : "sell-text"}">${row.side}</td><td>${usd(row.low)}–${usd(row.high)}</td><td>${fmt(row.distancePct,2)}% / ${fmt(row.distanceBps,1)} bp / ${row.distanceAtr == null ? "—" : `${fmt(row.distanceAtr,2)} ATR`}</td><td>${fmt(row.btc,2)}</td><td>${usd(row.notional)}</td><td>${fmt(row.persistence,1)}s</td><td>${row.replenishment > .25 ? "REPLENISHING" : row.depletion > 0 ? "DEPLETING" : "MIXED"}</td><td class="${row.status === "SPOOF_WATCH" ? "subtle-warning" : ""}">${row.status}</td></tr>`).join("") || `<tr><td colspan="8" class="empty-state">No nearby visible cluster in current book</td></tr>`;
 }
 
-function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); renderIntelligence(); }
+function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); renderIntelligence(); renderBrief(); renderChart(); }
 
 function setupNav() {
   document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => {
@@ -595,8 +739,13 @@ function setupNav() {
   document.querySelectorAll(".tf-btn").forEach(button => button.addEventListener("click", async () => {
     document.querySelectorAll(".tf-btn").forEach(item => item.classList.remove("active")); button.classList.add("active"); state.interval = button.dataset.interval; setText("chart-interval", state.interval);
     try {
-      const rows = await json(`${CONFIG.rest}/klines?symbol=${CONFIG.symbol}&interval=${state.interval}&limit=500`); state.klines = rows.filter(row => Number(row[6]) < Date.now()).map(row => ({ time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[7]), closed: true })); renderChart(); renderContext(); log(`Switched to ${state.interval} closed Futures candles`, "good");
+      const requests = [json(`${CONFIG.rest}/klines?symbol=${CONFIG.symbol}&interval=${state.interval}&limit=500`)];
+      if (CONFIG.backend && !state.directFallbackStarted) requests.push(json(`${CONFIG.backend}/orderbook/intelligence?timeframe=${state.interval}`, { timeout: 5000 }));
+      const [rows, intelligence] = await Promise.all(requests); state.klines = rows.filter(row => Number(row[6]) < Date.now()).map(row => ({ time: Number(row[0]) / 1000, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[7]), closed: true })); if (intelligence) state.intelligence = intelligence; state.lastKlineAt = Date.now(); renderAll(); renderContext(); log(`Switched to ${state.interval} closed Futures candles and matching delta`, "good");
     } catch (error) { log(`Interval load failed: ${error.message}`, "warn"); }
+  }));
+  document.querySelectorAll(".indicator-toggle").forEach(button => button.addEventListener("click", () => {
+    const name = button.dataset.indicator; if (state.visibleIndicators.has(name)) state.visibleIndicators.delete(name); else state.visibleIndicators.add(name); button.classList.toggle("active", state.visibleIndicators.has(name)); renderChart();
   }));
   $("refresh-btn").addEventListener("click", () => { state.book.valid = false; state.book.queue = []; syncBook(); loadDerivatives(); loadHistory(); });
   $("clear-log").addEventListener("click", () => { state.events = []; renderHealthLog(); });
@@ -609,7 +758,7 @@ async function boot() {
   } else {
     await Promise.all([loadHistory(), loadDerivatives()]); openStream(); setInterval(loadDerivatives, 30000); setInterval(pollKline, 5000); pollKline();
   }
-  setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderIntelligence, 1000); setInterval(renderLiquidations, 5000); renderAll(); log("Terminal booted in read-only research mode", "good");
+  setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderIntelligence, 1000); setInterval(renderBrief, 1000); setInterval(renderLiquidations, 5000); renderAll(); log("Terminal booted in read-only liquidity-intelligence mode", "good");
 }
 
 boot();

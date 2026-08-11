@@ -1,0 +1,116 @@
+#price-chart {
+  position: relative;
+  overflow: hidden;
+}
+
+.indicator-panel {
+  height: 150px;
+  position: relative;
+  overflow: hidden;
+  padding: 0;
+}
+
+.indicator-panel[hidden] { display: none; }
+.indicator-panel canvas { height: 150px; }
+
+.indicator-legend {
+  position: absolute;
+  left: 10px;
+  top: 6px;
+  z-index: 2;
+}
+
+.indicator-legend .cvd { color: #b89cff; }
+.indicator-legend .rsi { color: #f7c968; }
+.indicator-legend .macd { color: #5ed7ff; }
+
+.profile-overlay {
+  position: absolute;
+  right: 64px;
+  top: 8px;
+  width: 150px;
+  max-height: 380px;
+  padding: 7px;
+  background: #07111fbb;
+  border: 1px solid #203b50;
+  z-index: 4;
+  pointer-events: none;
+  backdrop-filter: blur(3px);
+}
+
+.profile-overlay > b {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--cyan);
+  font: 800 8px var(--mono);
+}
+
+.profile-overlay > div {
+  height: 11px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.profile-overlay i {
+  position: absolute;
+  right: 0;
+  height: 6px;
+  min-width: 3px;
+  background: linear-gradient(90deg, #5ed7ff44, #b89cff99);
+}
+
+.profile-overlay span {
+  z-index: 1;
+  padding-right: 2px;
+  color: #c6d8e2;
+  font: 7px var(--mono);
+}
+
+.profile-overlay small { color: var(--muted); font: 8px var(--mono); }
+.market-message { margin: 0 15px 12px; border-left: 3px solid var(--cyan); }
+.brief-grid { margin: 0 15px 12px; border: 1px solid var(--border); }
+.detector-grid b { display: block; margin-top: 3px; color: #d8e7ef; }
+
+.wall-table {
+  min-width: 1250px;
+  width: 100%;
+  border-collapse: collapse;
+  font: 9px var(--mono);
+}
+
+.wall-table th, .wall-table td { padding: 9px 10px; vertical-align: top; }
+
+.role-chip {
+  display: inline-block;
+  padding: 3px 5px;
+  border: 1px solid #2f5f78;
+  color: var(--cyan);
+  font: 700 8px var(--mono);
+  max-width: 150px;
+  white-space: normal;
+}
+
+.wall-intent {
+  display: block;
+  justify-self: center;
+  max-width: 104px;
+  padding: 2px 4px;
+  border: 1px solid #3a5b71;
+  color: #9eb5c4;
+  font: 700 6px var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 2;
+}
+
+.wall-intent.real { border-color: #28704f; color: var(--green); }
+.wall-intent.risk { border-color: #8b3a4b; color: #ff9aaa; }
+.wall-intent.watch { border-color: #715d31; color: var(--amber); }
+
+@media (max-width: 620px) {
+  .profile-overlay { display: none; }
+  .market-message { font-size: 11px; }
+}

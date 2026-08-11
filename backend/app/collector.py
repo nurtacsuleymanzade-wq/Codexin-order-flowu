@@ -35,7 +35,7 @@ class BinanceCollector:
         return "/".join((f"{symbol}@trade", f"{symbol}@depth@100ms", f"{symbol}@bookTicker", f"{symbol}@forceOrder", f"{symbol}@markPrice@1s"))
 
     async def start(self) -> None:
-        self.http = httpx.AsyncClient(timeout=8, headers={"User-Agent": "codexin-order-flow/0.3"})
+        self.http = httpx.AsyncClient(timeout=8, headers={"User-Agent": "codexin-order-flow/0.4"})
         await self.store.start()
         self.tasks = [asyncio.create_task(self.websocket_loop()), asyncio.create_task(self.rest_loop())]
 
@@ -61,11 +61,12 @@ class BinanceCollector:
                         message = json.loads(raw); data = message.get("data", message); stream = message.get("stream", "")
                         self.state.last_ws_at = now_ms()
                         if "@trade" in stream or data.get("e") in ("trade", "aggTrade"):
-                            item = self.state.trade(data); await self.store.enqueue("trade", data, self.settings.symbol)
+                            self.state.trade(data); await self.store.enqueue("trade", data, self.settings.symbol); await self.archive_intelligence_events()
                         elif "@depth" in stream or data.get("e") == "depthUpdate":
                             await self.on_depth(data)
                         elif "bookTicker" in stream or data.get("e") == "bookTicker":
                             self.state.best_bid = float(data["b"]); self.state.best_ask = float(data["a"]); self.state.price = (self.state.best_bid + self.state.best_ask) / 2; self.state.last_ticker_at = now_ms()
+                            self.state.intelligence.on_price(self.state.price, self.state.last_ticker_at)
                         elif "markPrice" in stream or data.get("e") == "markPriceUpdate":
                             self.state.mark_price = float(data.get("p") or self.state.mark_price or 0); self.state.index_price = float(data.get("i") or self.state.index_price or 0); self.state.last_ws_at = now_ms()
                         elif "forceOrder" in stream or data.get("e") == "forceOrder":
@@ -83,18 +84,30 @@ class BinanceCollector:
         if not book.valid:
             book.buffer(event); return
         try:
-            book.apply(event); self.state.last_book_at = now_ms()
+            changes = book.apply(event); received = now_ms(); self.state.last_book_at = received
+            self.state.intelligence.on_depth(changes, received, self.state.price, self.state.intelligence.last_atr)
+            await self.archive_intelligence_events()
         except (SequenceGap, KeyError, TypeError, ValueError) as error:
             book.invalidate(); book.buffer(event); self.last_error = f"orderbook gap: {error}"
             if not self.book_sync_lock.locked(): asyncio.create_task(self.sync_orderbook())
+
+    async def archive_intelligence_events(self) -> None:
+        for event in self.state.intelligence.drain_archive_events():
+            await self.store.enqueue(str(event.get("event_type", "intelligence_event")).lower(), event, self.settings.symbol)
 
     async def sync_orderbook(self) -> None:
         if not self.http:
             return
         async with self.book_sync_lock:
+            # A websocket gap and the periodic REST loop can request a
+            # snapshot at the same time.  Once the first request has bridged
+            # the buffered stream, the second request must not rebuild the
+            # book again (or inflate resync counters).
+            if self.state.orderbook.valid:
+                return
             try:
                 response = await self.http.get(f"{self.settings.rest_url}/depth", params={"symbol": self.settings.symbol, "limit": 1000})
-                response.raise_for_status(); snapshot = response.json(); self.state.orderbook.apply_buffered(snapshot); self.state.last_book_at = now_ms()
+                response.raise_for_status(); snapshot = response.json(); self.state.orderbook.apply_buffered(snapshot); self.state.last_book_at = now_ms(); self.state.intelligence.reset_from_book(self.state.orderbook, self.state.last_book_at, self.state.price); await self.archive_intelligence_events()
             except SequenceGap:
                 self.state.orderbook.invalidate()
             except Exception as error:
@@ -109,7 +122,11 @@ class BinanceCollector:
                 await self.poll_klines()
                 if now_ms() >= derivative_due:
                     await self.poll_derivatives(); derivative_due = now_ms() + 30000
-                await self.store.publish_snapshot(f"codexin:snapshot:{self.settings.symbol}", self.state.snapshot())
+                snapshot = self.state.snapshot()
+                await self.store.publish_snapshot(f"codexin:snapshot:{self.settings.symbol}", snapshot)
+                intelligence = snapshot.get("intelligence", {})
+                if intelligence.get("status") == "LIVE":
+                    await self.store.enqueue("liquidity_intelligence", {"generated_at": intelligence.get("generated_at"), "direction": intelligence.get("direction"), "targets": intelligence.get("targets", []), "detectors": intelligence.get("detectors", {}), "probability_status": intelligence.get("probability_status")}, self.settings.symbol)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -118,9 +135,10 @@ class BinanceCollector:
 
     async def poll_klines(self) -> None:
         if not self.http: return
-        response = await self.http.get(f"{self.settings.rest_url}/klines", params={"symbol": self.settings.symbol, "interval": "1m", "limit": 2}); response.raise_for_status()
+        response = await self.http.get(f"{self.settings.rest_url}/klines", params={"symbol": self.settings.symbol, "interval": "1m", "limit": 500}); response.raise_for_status()
         for row in response.json():
             self.state.update_kline({"time": int(row[0]) // 1000, "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[7]), "closed": int(row[6]) < now_ms()})
+        self.state.intelligence.last_atr = self.state.intelligence.indicators(list(self.state.klines), list(self.state.buckets.values()), "1m").get("atr")
 
     async def poll_derivatives(self) -> None:
         if not self.http: return
@@ -145,6 +163,7 @@ class BinanceCollector:
         oi_status = "LIVE" if s.last_oi_at and now - s.last_oi_at < self.settings.oi_sla_ms else "STALE" if s.open_interest is not None else "UNAVAILABLE"
         funding_status = "LIVE" if s.last_funding_at and now - s.last_funding_at < self.settings.funding_sla_ms else "STALE" if s.funding_rate is not None else "UNAVAILABLE"
         liquidation_status = "LIVE_QUIET" if self.connected and s.last_ws_at and now - s.last_ws_at < 5000 else "UNAVAILABLE"
-        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade · isBuyerMaker side rule"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count} · aggregated price levels", "OBSERVED_AGGREGATED_L2"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions", "UNAVAILABLE")}
+        intelligence_status = "LIVE" if book_status == "LIVE" and trade_status == "LIVE" else "SUPPRESSED"
+        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade · isBuyerMaker side rule"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count} · aggregated price levels", "OBSERVED_AGGREGATED_L2"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "intelligence": feed(intelligence_status, s.last_book_at, "LOCAL_LIQUIDITY_INTELLIGENCE", f"tracked_walls={len(s.intelligence.walls)} base_levels={len(s.intelligence.levels)} detector_latency_ms={s.intelligence.last_latency_ms:.2f} reconciliation_error={s.intelligence.reconciliation_error():.4f}", "HEURISTIC_SCORES_UNCALIBRATED"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions", "UNAVAILABLE")}
         critical = ("trades", "orderbook", "klines", "open_interest", "funding", "liquidations"); missing = [key for key in critical if not feeds[key]["status"].startswith("LIVE")]
         return {"overall": "LIVE" if not missing else "DEGRADED", "market": s.symbol, "venue": s.venue, "market_type": s.market, "decision_authorized": False, "feeds": feeds, "missing_data": missing + ["calibration"], "last_error": self.last_error, "generated_at": iso_ms(now) or ""}

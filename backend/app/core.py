@@ -29,6 +29,7 @@ class LocalOrderBook:
     def __init__(self, max_queue: int = 5000) -> None:
         self.bids: dict[str, float] = {}
         self.asks: dict[str, float] = {}
+        self.level_last_update: dict[str, int] = {}
         self.last_update_id: int | None = None
         self.last_event_id: int | None = None
         self.valid = False
@@ -43,6 +44,8 @@ class LocalOrderBook:
     def reset(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         self.bids = {str(price): float(qty) for price, qty in snapshot.get("bids", []) if float(qty) > 0}
         self.asks = {str(price): float(qty) for price, qty in snapshot.get("asks", []) if float(qty) > 0}
+        received = now_ms()
+        self.level_last_update = {f"BID:{price}": received for price in self.bids} | {f"ASK:{price}": received for price in self.asks}
         self.last_update_id = int(snapshot["lastUpdateId"])
         self.last_event_id = None
         self.valid = False
@@ -62,31 +65,49 @@ class LocalOrderBook:
                 return index
         return -1
 
-    def apply(self, event: dict[str, Any]) -> None:
+    def apply(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         if self.last_update_id is None:
             raise SequenceGap("book has no REST snapshot")
         final_id = int(event["u"])
+        first_id = int(event.get("U", final_id))
+        if self.last_event_id is not None and final_id <= self.last_event_id:
+            return []
+        if self.last_event_id is None and final_id <= self.last_update_id:
+            return []
         if self.last_event_id is None:
-            if int(event.get("U", 0)) > self.last_update_id + 1:
-                raise SequenceGap(f"initial U={event.get('U')} after snapshot={self.last_update_id}")
+            if first_id > self.last_update_id + 1 or final_id < self.last_update_id + 1:
+                raise SequenceGap(f"initial U/u={first_id}/{final_id} does not bridge snapshot={self.last_update_id}")
         elif event.get("pu") is not None and int(event["pu"]) != self.last_event_id:
             raise SequenceGap(f"pu={event.get('pu')} expected={self.last_event_id}")
+        elif event.get("pu") is None and first_id > self.last_event_id + 1:
+            raise SequenceGap(f"U={first_id} after previous u={self.last_event_id}")
+        received = now_ms()
+        changes: list[dict[str, Any]] = []
         for price, quantity in event.get("b", []):
             key, value = str(price), float(quantity)
+            old_value = self.bids.get(key, 0.0)
             if value == 0:
                 self.bids.pop(key, None)
             else:
                 self.bids[key] = value
+            self.level_last_update[f"BID:{key}"] = received
+            if old_value != value:
+                changes.append({"side": "BID", "price": float(price), "old_qty": old_value, "new_qty": value, "event_id": int(event["u"]), "event_time": int(event.get("E") or event.get("T") or received)})
         for price, quantity in event.get("a", []):
             key, value = str(price), float(quantity)
+            old_value = self.asks.get(key, 0.0)
             if value == 0:
                 self.asks.pop(key, None)
             else:
                 self.asks[key] = value
+            self.level_last_update[f"ASK:{key}"] = received
+            if old_value != value:
+                changes.append({"side": "ASK", "price": float(price), "old_qty": old_value, "new_qty": value, "event_id": int(event["u"]), "event_time": int(event.get("E") or event.get("T") or received)})
         self.last_update_id = final_id
         self.last_event_id = final_id
         self.last_event_at = now_ms()
         self.valid = True
+        return changes
 
     def apply_buffered(self, snapshot: dict[str, Any]) -> None:
         events = self.reset(snapshot)
@@ -182,6 +203,11 @@ class MarketState:
     liquidations: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
     buckets: dict[int, dict[str, Any]] = field(default_factory=dict)
     klines: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
+    intelligence: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        from .intelligence import LiquidityIntelligenceEngine
+        self.intelligence = LiquidityIntelligenceEngine(self.symbol)
 
     def trade(self, event: dict[str, Any], received_at: int | None = None) -> dict[str, Any]:
         received = received_at or now_ms()
@@ -193,6 +219,7 @@ class MarketState:
         self.cvd += notional if buy else -notional
         self.vwap_pv += price * notional; self.vwap_notional += notional
         self.trades.appendleft(item)
+        self.intelligence.on_trade(item, received)
         bucket_time = event_time // 60000 * 60000
         bucket = self.buckets.setdefault(bucket_time, {"time": bucket_time, "buy": 0.0, "sell": 0.0, "count": 0})
         bucket["buy" if buy else "sell"] += notional; bucket["count"] += 1
@@ -220,16 +247,21 @@ class MarketState:
             return None
         return max(0, (current or now_ms()) - timestamp)
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, intelligence_trusted: bool | None = None) -> dict[str, Any]:
         current = now_ms(); metrics = self.orderbook.metrics()
+        book_fresh = self.last_book_at is not None and self.age(self.last_book_at, current) <= 1500
+        trade_fresh = self.last_trade_at is not None and self.age(self.last_trade_at, current) <= 3000
+        trusted = book_fresh and trade_fresh if intelligence_trusted is None else intelligence_trusted
+        intelligence = self.intelligence.snapshot(self.orderbook, list(self.klines), list(self.buckets.values()), self.price, current, data_integrity_ok=trusted) if self.intelligence else {"status": "UNAVAILABLE"}
         return {
             "market": {"venue": self.venue, "market": self.market, "symbol": self.symbol, "market_type": "PERPETUAL"},
             "price": {"last": self.price, "mark": self.mark_price, "index": self.index_price, "best_bid": self.best_bid, "best_ask": self.best_ask},
-            "flow": {"cvd": self.cvd, "vwap": self.vwap_pv / self.vwap_notional if self.vwap_notional else None, "trade_count": self.trade_count, "buckets": list(self.buckets.values())[-30:]},
+            "flow": {"cvd": self.cvd, "vwap": self.vwap_pv / self.vwap_notional if self.vwap_notional else None, "trade_count": self.trade_count, "buckets": list(self.buckets.values())[-500:]},
             "derivatives": {"open_interest": self.open_interest, "funding_rate": self.funding_rate, "positioning": self.ratio},
             "orderbook": {**metrics, "age_ms": self.age(self.last_book_at)},
             "liquidations": {"recent": list(self.liquidations)[:50], "age_ms": self.age(self.last_liquidation_at)},
             "candles": {"rows": list(self.klines)[-200:], "age_ms": self.age(self.last_kline_at)},
             "freshness": {"trade_age_ms": self.age(self.last_trade_at), "book_age_ms": self.age(self.last_book_at), "oi_age_ms": self.age(self.last_oi_at), "funding_age_ms": self.age(self.last_funding_at)},
+            "intelligence": intelligence,
             "received_at": iso_ms(current),
         }

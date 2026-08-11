@@ -11,7 +11,11 @@ Status = Literal["LIVE", "LIVE_QUIET", "STALE", "INVALID", "UNAVAILABLE", "ERROR
 class FeedHealth(TypedDict):
     status: Status
     age_ms: int | None
+    timestamp: str | None
+    received_timestamp: str | None
     source: str
+    methodology: str
+    confidence: str
     detail: str
 
 

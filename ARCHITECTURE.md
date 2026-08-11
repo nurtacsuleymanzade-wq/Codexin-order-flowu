@@ -1,19 +1,23 @@
 # Codexin Order Flow architecture
 
-## Current release: browser terminal + backend data plane v0.3.0
+## Current release: browser terminal + Liquidity Intent Engine v0.4.0
 
 The repository is intentionally narrow: one venue, one market and one instrument.
 
 ```text
 Binance USD-M REST + WebSocket
           ↓
-Browser-side event validation
+Collector: trade/depth/bookTicker/mark/forceOrder
           ↓
-Local Futures order book + tape aggregation
+REST snapshot + buffered diff-depth sequence validator
           ↓
-Read-only workspaces
+Base book (all levels) + tracked wall lifecycle (significant levels only)
           ↓
-NO TRADE gate when evidence is missing, stale or invalid
+Trade/depth reconciliation → aggression → absorption/replenishment/pull/iceberg
+           ↓
+Microprice/OBI/vacuum/LRI → target touch-score + conditional break-score
+           ↓
+Versioned API + chart workspaces; stale/invalid data suppresses intelligence
 ```
 
 ### Contract boundaries
@@ -26,6 +30,19 @@ NO TRADE gate when evidence is missing, stale or invalid
 - Open interest, funding and public long/short ratios are REST context feeds.
 - CVD and VWAP are session measurements derived from the received Futures trade stream.
 - Resting liquidity is observed displayed intent, not proof of execution or absorption.
+- Depth quantity decreases are reconciled against the Futures trade tape. Unmatched
+  decreases remain `unknown_removed_qty`; they are never silently called executions.
+- A `LiquidityWall` is opened only for dynamically significant levels and keeps a
+  bounded lifecycle: first/last seen, persistence, approach pull, replenishment,
+  execution/cancel estimates, absorption and iceberg-like turnover.
+- `P_TOUCH` and `P_BREAK_GIVEN_TOUCH` are separate fields. Until labelled replay
+  history passes out-of-sample calibration, both are `null` and the API exposes
+  `probability_status=UNCALIBRATED`; visible `TOUCH_SCORE`/`BREAK_SCORE` values are
+  heuristic evidence ranks.
+- Clusters use adaptive ATR-relative price bins. Near/medium/far target regimes
+  weight microstructure, depth path and broader structure differently.
+- Migration is explicitly a pattern-match inference (`NO ORDER_ID`); spoof-like
+  output is a pull-before-touch behaviour score, not a legal manipulation claim.
 - Liquidation zones are estimated from an OI/leverage prior and are never labeled as observed force orders.
 
 ## Implemented backend
@@ -62,4 +79,7 @@ Required production controls:
 
 ## Deliberate non-features
 
-This release does not place orders, expose API keys, claim observed liquidations, or display uncalibrated scores as probabilities.
+This release does not place orders, expose API keys, claim observed liquidations, or display uncalibrated scores as probabilities. The event archive is
+also the source for future target labels (`touch_10s` … `touch_5m`, break after
+touch, pull and replenishment), but no calibration claim is made until that
+dataset is replayable and validated.

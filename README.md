@@ -15,6 +15,8 @@ Market-data-first BTCUSDT USD-M Futures research terminal.
 - CVD, session VWAP, trade count, footprint buckets and displayed-book imbalance
 - Above-the-fold Order Book Intelligence: weighted imbalance, microprice, full visible BTC/USDT totals, dynamic BTC size buckets, liquidity clusters and deterministic scenario cards
 - Per-level lifecycle evidence from aggregated L2 deltas: persistence, add/remove/refill/pull inference and `SPOOF_WATCH` evidence without trader attribution
+- Lifecycle-aware Liquidity Intent Engine: tracked walls, execution-versus-cancel reconciliation, clusters, effective liquidity, vacuum/LRI path scores, absorption, exhaustion, trapped-flow, migration and replenishment evidence
+- Multi-timeframe chart intelligence: VWAP, CVD, delta, volume, RSI, MACD, POC/HVN/LVN, VAH/VAL, TPO, premium/discount/equilibrium and HH/HL/LH/LL/BOS/CHOCH/MSB overlays with user toggles
 - Explicit stale-data suppression and calibration guards: target probability is `UNTRAINED` and ETTT is `INSUFFICIENT SAMPLE` until replayable out-of-sample calibration exists
 - Execution, liquidity, derivatives, context and data-health workspaces
 
@@ -48,6 +50,7 @@ The API exposes the canonical contracts at:
 - `GET /api/v1/health`
 - `GET /api/v1/live/BTCUSDT/futures/snapshot`
 - `GET /api/v1/orderbook/live`
+- `GET /api/v1/orderbook/intelligence?timeframe=1m`
 - `GET /api/v1/flow/summary?tf=5m`
 - `GET /api/v1/liquidations/recent`
 - `GET /api/v1/probability-map/summary?tf=5m`
@@ -76,6 +79,7 @@ from Futures to Spot.
 7. This project does not place trades.
 8. Unique buyer/seller counts are never inferred from Binance aggregated depth; the UI uses visible aggregated price-level counts and shows `UNAVAILABLE — aggregated depth does not identify unique traders`.
 9. Estimated stop/liquidation zones are always labeled as model output and are not the observed `forceOrder` feed.
+10. `TOUCH_SCORE` and `BREAK_SCORE` are heuristic rankings. `P_TOUCH` and `P_BREAK_GIVEN_TOUCH` stay null with `probability_status=UNCALIBRATED` until labelled replay data passes out-of-sample calibration.
 
 ## Production status
 
