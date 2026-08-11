@@ -12,6 +12,8 @@ Environment=CODEXIN_SYMBOL=BTCUSDT
 Environment=CODEXIN_CORS_ORIGINS=https://nurtacsuleymanzade-wq.github.io,http://localhost:4173
 Environment=CODEXIN_RAW_DIR=/var/lib/codexin-order-flow/raw-events
 Environment=CODEXIN_REDIS_URL=redis://127.0.0.1:6379/1
+Environment=CODEXIN_MIN_RR=1.5
+EnvironmentFile=-/etc/codexin-order-flow/secrets.env
 ExecStart=/root/.agent-reach-venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8020 --workers 1
 Restart=always
 RestartSec=5

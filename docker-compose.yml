@@ -7,6 +7,10 @@ services:
       CODEXIN_RAW_DIR: /app/data/raw-events
       CODEXIN_REDIS_URL: redis://redis:6379/0
       CODEXIN_CLICKHOUSE_URL: clickhouse://clickhouse:8123/default
+      CODEXIN_MIN_RR: ${CODEXIN_MIN_RR:-1.5}
+      CODEXIN_TELEGRAM_ENABLED: ${CODEXIN_TELEGRAM_ENABLED:-true}
+      CODEXIN_TELEGRAM_BOT_TOKEN: ${CODEXIN_TELEGRAM_BOT_TOKEN:-}
+      CODEXIN_TELEGRAM_CHAT_ID: ${CODEXIN_TELEGRAM_CHAT_ID:-}
     ports:
       - "8000:8000"
     volumes:

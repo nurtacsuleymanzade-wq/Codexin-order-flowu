@@ -29,7 +29,7 @@ const state = {
   aggression: { buy: 0, sell: 0, count: 0, volume: 0 },
   book: { bids: new Map(), asks: new Map(), lastUpdateId: null, lastEventId: null,
     valid: false, resyncs: 0, queue: [], syncing: false, renderQueued: false },
-  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, directFallbackStarted: false, chart: null, candleSeries: null,
+  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, decisionBrain: null, directFallbackStarted: false, chart: null, candleSeries: null,
   volumeSeries: null, vwapSeries: null, chartPriceLines: [],
   visibleIndicators: new Set(["vwap", "volume", "cvd", "structure", "detectors"])
 };
@@ -62,7 +62,7 @@ function setClass(id, cls) { const el = $(id); if (el) el.className = cls; }
 function scheduleUiRender() {
   if (state.uiRenderScheduled) return;
   state.uiRenderScheduled = true;
-  setTimeout(() => { state.uiRenderScheduled = false; renderTape(); renderFlow(); renderHeader(); renderDecision(); renderContext(); }, 100);
+  setTimeout(() => { state.uiRenderScheduled = false; renderTape(); renderFlow(); renderHeader(); renderDecision(); renderDecisionBrain(); renderContext(); }, 100);
 }
 
 async function json(url, options = {}) {
@@ -85,6 +85,7 @@ async function pollBackendSnapshot() {
     state.oi = derivatives.open_interest ?? state.oi; state.funding = derivatives.funding_rate ?? state.funding; state.ratios = derivatives.positioning ?? state.ratios;
     state.buckets = new Map((flow.buckets || []).map(bucket => [Number(bucket.time), bucket]));
     state.intelligence = snapshot.intelligence || state.intelligence;
+    state.decisionBrain = snapshot.decision_brain || state.decisionBrain;
     if (state.interval === "1m") state.klines = (snapshot.candles?.rows || []).map(row => ({ time: Number(row.time), open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), volume: Number(row.volume), closed: Boolean(row.closed) }));
     state.liquidations = snapshot.liquidations?.recent || [];
     if (orderbook.bids && orderbook.asks) {
@@ -412,8 +413,9 @@ function estimatedZones() {
 function renderLiquidity(metrics = bookMetrics()) {
   if (!metrics.valid) return;
   setText("liq-bid-notional", usd(metrics.bid10)); setText("liq-ask-notional", usd(metrics.ask10)); setText("liq-bid-share", `${metrics.bidShare.toFixed(1)}% of ±10bps displayed book`); setText("liq-ask-share", `${metrics.askShare.toFixed(1)}% of ±10bps displayed book`);
-  const zones = estimatedZones(); setText("liq-nearest", zones[0] ? usd(zones[0].price) : "—");
-  $("liquidity-bars").innerHTML = zones.length ? zones.map(zone => `<div class="liq-zone"><span class="zone-price">${usd(zone.price)}</span><span class="zone-bar" style="width:${Math.max(8, zone.size / zones[0].size * 100)}%"></span><span class="zone-size">${fmt(zone.size, 0)} BTC</span></div>`).join("") : `<div class="empty-state">Waiting for OI and mark price</div>`;
+  const estimated = state.decisionBrain?.liquidation_heatmap?.estimated || [], zones = estimated.length ? estimated.map(item => ({ ...item, size: Number(item.estimated_liquidation_density || 0) })) : estimatedZones().map(item => ({ ...item, confidence: null, cascade_probability: null, type: "OI_LEVERAGE_PRIOR" }));
+  setText("liq-nearest", zones[0] ? usd(zones[0].price) : "—");
+  $("liquidity-bars").innerHTML = zones.length ? zones.map(zone => `<div class="liq-zone"><span class="zone-price">${usd(zone.price)}<small>${esc(zone.type || "ESTIMATED")}</small></span><span class="zone-bar" style="width:${Math.max(8, zone.size / Math.max(zones[0].size, 1) * 100)}%"></span><span class="zone-size">${fmt(zone.size, 0)} BTC<br><small>conf ${zone.confidence == null ? "N/A" : `${fmt(Number(zone.confidence) * 100,0)}%`} · cascade ${zone.cascade_probability == null ? "N/A" : `${fmt(zone.cascade_probability,0)}%`}</small></span></div>`).join("") : `<div class="empty-state">WAITING FOR OI / STRUCTURE DATA</div>`;
   const backendWalls = (state.intelligence?.walls || []).filter(wall => wall.visible).sort((a, b) => Number(b.importance_score || 0) - Number(a.importance_score || 0)).slice(0, 30);
   if (backendWalls.length) {
     $("large-orders-table").innerHTML = backendWalls.map(wall => {
@@ -574,14 +576,39 @@ function renderHealthLog() { if ($("health-log")) $("health-log").innerHTML = st
 
 function renderDecision() {
   const metrics = bookMetrics(), now = Date.now(), backendLiq = state.backendHealth?.feeds?.liquidations?.status, wsLive = backendLiq ? backendLiq.startsWith("LIVE") : state.wsConnected && now - state.lastWsAt < CONFIG.freshness.ws;
+  const brain = state.decisionBrain, brainDecision = brain?.final_decision || "NO TRADE";
   const checks = [
     { label: "Futures trade stream", ok: state.lastTradeAt && now - state.lastTradeAt < CONFIG.freshness.trade, value: state.lastTradeAt ? "LIVE" : "WAITING" },
     { label: "L2 sequence validity", ok: metrics.valid && now - state.lastBookAt < CONFIG.freshness.book, value: metrics.valid ? "VALID" : "INVALID" },
     { label: "Observed liquidation feed", ok: wsLive, value: wsLive ? "LIVE / QUIET" : "UNAVAILABLE" },
     { label: "Historical calibration", ok: false, value: "UNAVAILABLE" },
-    { label: "Execution authorization", ok: false, value: "LOCKED" }
+    { label: "15M → 5M → 1M hierarchy", ok: Boolean(brain && brain.market_regime !== "N/A"), value: brain ? `${brain.market_regime} / ${brain.five_minute_direction} / ${(brain.one_minute_structure || {}).label || "N/A"}` : "WAITING" },
+    { label: "1S confirmation", ok: brain?.one_second_confirmation?.status === "CONFIRMED", value: brain?.one_second_confirmation?.status || "WAITING" },
+    { label: "Execution authorization", ok: false, value: "LOCKED · READ ONLY" }
   ];
-  $("decision-checks").innerHTML = checks.map(check => `<div class="check-row"><span>${check.label}</span><b class="${check.ok ? "ok" : "bad"}">${check.value}</b></div>`).join(""); setText("decision-reason", "Observed flow is displayed. Historical calibration is unavailable; execution remains locked.");
+  $("decision-checks").innerHTML = checks.map(check => `<div class="check-row"><span>${check.label}</span><b class="${check.ok ? "ok" : "bad"}">${esc(check.value)}</b></div>`).join(""); setText("decision-label", brainDecision); setText("decision-reason", brain?.final_reason || "Observed flow is displayed. Execution remains locked.");
+}
+
+function renderDecisionBrain() {
+  const brain = state.decisionBrain, panel = $("decision-brain-panel");
+  if (!panel) return;
+  if (!brain) {
+    setText("db-status", "WAITING FOR DATA"); setText("db-final-decision", "NO TRADE"); setText("db-reason", "Decision Brain snapshot bekleniyor.");
+    ["db-long-score","db-short-score","db-regime","db-5m-direction","db-1m-structure","db-1m-bos","db-1m-choch","db-location","db-entry","db-sl","db-tp","db-primary-target","db-target-type","db-path","db-rr","db-bias"].forEach(id => setText(id, "N/A"));
+    setText("db-confirmation", "WAITING FOR DATA"); setText("db-entry-status", "NOT READY"); setText("db-monitor", "NO ACTIVE POSITION"); return;
+  }
+  const structure1 = brain.one_minute_structure || {}, confirmation = brain.one_second_confirmation || {}, target = brain.primary_target || {}, path = brain.order_book_path || {}, monitor = brain.position_monitor || {};
+  const show = value => value === null || value === undefined || value === "" ? "N/A" : String(value);
+  const money = value => Number.isFinite(Number(value)) ? usd(value) : "N/A";
+  const location = brain.location || {}, locationText = location.label && location.label !== "MID-RANGE" ? location.label : [...(location.long_reasons || []), ...(location.short_reasons || [])].join("/") || "N/A";
+  const decision = show(brain.final_decision || "NO TRADE"); panel.dataset.decision = decision;
+  setText("db-status", brain.status === "LIVE" ? "LIVE · POINT SCORES" : "WAITING FOR DATA"); setText("db-final-decision", decision); setText("db-reason", show(brain.final_reason));
+  setText("db-long-score", show(brain.long_score)); setText("db-short-score", show(brain.short_score)); setText("db-monitor", show(monitor.status || "NO ACTIVE POSITION"));
+  setText("db-regime", show(brain.market_regime)); setText("db-5m-direction", show(brain.five_minute_direction)); setText("db-1m-structure", show(structure1.label)); setText("db-1m-bos", show(structure1.last_bos)); setText("db-1m-choch", show(structure1.last_choch)); setText("db-location", locationText); setText("db-confirmation", show(confirmation.status)); setText("db-bias", show(brain.final_bias));
+  setText("db-entry-status", show(brain.entry_status)); setText("db-entry", money(brain.entry)); setText("db-sl", money(brain.stop_loss)); setText("db-tp", money(brain.take_profit)); setText("db-primary-target", money(target.price)); setText("db-target-type", show(brain.target_type)); setText("db-path", show(path.label)); setText("db-rr", brain.risk_reward == null ? "N/A" : `${Number(brain.risk_reward).toFixed(2)}R`);
+  const scoreRows = [...(brain.score_basis?.long || []).map(item => ({ ...item, side: "LONG" })), ...(brain.score_basis?.short || []).map(item => ({ ...item, side: "SHORT" })), ...(brain.score_basis?.unavailable || []).map(item => ({ ...item, side: "N/A" }))].slice(-12);
+  $("db-evidence").innerHTML = scoreRows.length ? scoreRows.map(item => `<span><b>${esc(item.side)} +${esc(item.contribution)}</b> ${esc(item.name)} · ${esc(item.source)} · ${esc(item.value)}</span>`).join("") : `<span>INSUFFICIENT DATA · No score evidence available</span>`;
+  const lineage = brain.data_lineage || {}; $("db-lineage").innerHTML = ["15M","5M","1M","1S"].map(tf => `<span>${tf}: ${esc(lineage[tf] || "N/A")}</span>`).join("");
 }
 
 const SIZE_BUCKETS = [[0, 10, "0–10 BTC"], [10, 20, "10–20 BTC"], [20, 50, "20–50 BTC"], [50, 100, "50–100 BTC"], [100, 150, "100–150 BTC"], [150, 300, "150–300 BTC"], [300, Infinity, "300+ BTC"]];
@@ -729,7 +756,7 @@ function renderIntelligence() {
   $("clusters-table").innerHTML = clusters.slice(0, 8).map(row => `<tr><td class="${row.side === "BID" ? "buy-text" : "sell-text"}">${row.side}</td><td>${usd(row.low)}–${usd(row.high)}</td><td>${fmt(row.distancePct,2)}% / ${fmt(row.distanceBps,1)} bp / ${row.distanceAtr == null ? "—" : `${fmt(row.distanceAtr,2)} ATR`}</td><td>${fmt(row.btc,2)}</td><td>${usd(row.notional)}</td><td>${fmt(row.persistence,1)}s</td><td>${row.replenishment > .25 ? "REPLENISHING" : row.depletion > 0 ? "DEPLETING" : "MIXED"}</td><td class="${row.status === "SPOOF_WATCH" ? "subtle-warning" : ""}">${row.status}</td></tr>`).join("") || `<tr><td colspan="8" class="empty-state">No nearby visible cluster in current book</td></tr>`;
 }
 
-function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); renderIntelligence(); renderBrief(); renderChart(); }
+function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); renderDecisionBrain(); renderIntelligence(); renderBrief(); renderChart(); }
 
 function setupNav() {
   document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => {

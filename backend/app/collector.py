@@ -13,12 +13,15 @@ from .config import Settings
 from .contracts import HealthContract
 from .core import MarketState, SequenceGap, iso_ms, now_ms
 from .store import EventStore
+from .telegram import TelegramReporter
 
 
 class BinanceCollector:
     def __init__(self, settings: Settings, store: EventStore) -> None:
         self.settings = settings
         self.state = MarketState(symbol=settings.symbol)
+        self.state.decision_brain.min_rr = settings.min_rr
+        self.telegram = TelegramReporter(settings.telegram_bot_token, settings.telegram_chat_id, settings.telegram_enabled)
         self.store = store
         self.http: httpx.AsyncClient | None = None
         self.tasks: list[asyncio.Task[Any]] = []
@@ -123,6 +126,7 @@ class BinanceCollector:
                 if now_ms() >= derivative_due:
                     await self.poll_derivatives(); derivative_due = now_ms() + 30000
                 snapshot = self.state.snapshot()
+                await self.telegram.consider(snapshot.get("decision_brain", {}))
                 await self.store.publish_snapshot(f"codexin:snapshot:{self.settings.symbol}", snapshot)
                 intelligence = snapshot.get("intelligence", {})
                 if intelligence.get("status") == "LIVE":
@@ -135,9 +139,18 @@ class BinanceCollector:
 
     async def poll_klines(self) -> None:
         if not self.http: return
-        response = await self.http.get(f"{self.settings.rest_url}/klines", params={"symbol": self.settings.symbol, "interval": "1m", "limit": 500}); response.raise_for_status()
-        for row in response.json():
-            self.state.update_kline({"time": int(row[0]) // 1000, "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[7]), "closed": int(row[6]) < now_ms()})
+        async def fetch(timeframe: str) -> tuple[str, Any]:
+            response = await self.http.get(f"{self.settings.rest_url}/klines", params={"symbol": self.settings.symbol, "interval": timeframe, "limit": 500})
+            response.raise_for_status()
+            return timeframe, response.json()
+        results = await asyncio.gather(*(fetch(timeframe) for timeframe in ("1m", "5m", "15m")), return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                self.last_error = f"kline poll: {result}"
+                continue
+            timeframe, rows = result
+            for row in rows:
+                self.state.update_kline({"time": int(row[0]) // 1000, "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[7]), "closed": int(row[6]) < now_ms()}, timeframe=timeframe)
         self.state.intelligence.last_atr = self.state.intelligence.indicators(list(self.state.klines), list(self.state.buckets.values()), "1m").get("atr")
 
     async def poll_derivatives(self) -> None:
@@ -151,7 +164,10 @@ class BinanceCollector:
         )
         for result in results: result.raise_for_status()
         oi, funding, premium, ratio = [result.json() for result in results]; received = now_ms()
-        self.state.open_interest = float(oi["openInterest"]); self.state.funding_rate = float((funding[0].get("fundingRate") if funding else premium.get("lastFundingRate")) or 0); self.state.mark_price = float(premium.get("markPrice") or 0); self.state.index_price = float(premium.get("indexPrice") or 0); self.state.ratio = ratio[0] if ratio else None
+        next_oi = float(oi["openInterest"])
+        self.state.oi_delta = next_oi - self.state.open_interest if self.state.open_interest is not None else None
+        self.state.previous_open_interest = self.state.open_interest
+        self.state.open_interest = next_oi; self.state.funding_rate = float((funding[0].get("fundingRate") if funding else premium.get("lastFundingRate")) or 0); self.state.mark_price = float(premium.get("markPrice") or 0); self.state.index_price = float(premium.get("indexPrice") or 0); self.state.ratio = ratio[0] if ratio else None
         self.state.last_oi_at = self.state.last_funding_at = self.state.last_ratio_at = received
 
     def health(self) -> HealthContract:
@@ -160,10 +176,12 @@ class BinanceCollector:
         trade_status = "LIVE" if s.last_trade_at and now - s.last_trade_at < self.settings.trade_sla_ms else "STALE"
         book_status = "LIVE" if book.valid and s.last_book_at and now - s.last_book_at < self.settings.book_sla_ms else "INVALID" if not book.valid else "STALE"
         kline_status = "LIVE" if s.last_kline_at and now - s.last_kline_at < self.settings.kline_sla_ms else "STALE"
+        kline_5_status = "LIVE" if s.last_timeframe_kline_at.get("5m") and len(s.timeframe_klines.get("5m", ())) >= 7 and now - s.last_timeframe_kline_at["5m"] < self.settings.kline_sla_ms * 2 else "STALE"
+        kline_15_status = "LIVE" if s.last_timeframe_kline_at.get("15m") and len(s.timeframe_klines.get("15m", ())) >= 7 and now - s.last_timeframe_kline_at["15m"] < self.settings.kline_sla_ms * 2 else "STALE"
         oi_status = "LIVE" if s.last_oi_at and now - s.last_oi_at < self.settings.oi_sla_ms else "STALE" if s.open_interest is not None else "UNAVAILABLE"
         funding_status = "LIVE" if s.last_funding_at and now - s.last_funding_at < self.settings.funding_sla_ms else "STALE" if s.funding_rate is not None else "UNAVAILABLE"
         liquidation_status = "LIVE_QUIET" if self.connected and s.last_ws_at and now - s.last_ws_at < 5000 else "UNAVAILABLE"
         intelligence_status = "LIVE" if book_status == "LIVE" and trade_status == "LIVE" else "SUPPRESSED"
-        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade · isBuyerMaker side rule"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count} · aggregated price levels", "OBSERVED_AGGREGATED_L2"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "intelligence": feed(intelligence_status, s.last_book_at, "LOCAL_LIQUIDITY_INTELLIGENCE", f"tracked_walls={len(s.intelligence.walls)} base_levels={len(s.intelligence.levels)} detector_latency_ms={s.intelligence.last_latency_ms:.2f} reconciliation_error={s.intelligence.reconciliation_error():.4f}", "HEURISTIC_SCORES_UNCALIBRATED"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions", "UNAVAILABLE")}
-        critical = ("trades", "orderbook", "klines", "open_interest", "funding", "liquidations"); missing = [key for key in critical if not feeds[key]["status"].startswith("LIVE")]
-        return {"overall": "LIVE" if not missing else "DEGRADED", "market": s.symbol, "venue": s.venue, "market_type": s.market, "decision_authorized": False, "feeds": feeds, "missing_data": missing + ["calibration"], "last_error": self.last_error, "generated_at": iso_ms(now) or ""}
+        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade · isBuyerMaker side rule"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count} · aggregated price levels", "OBSERVED_AGGREGATED_L2"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "klines_5m": feed(kline_5_status, s.last_timeframe_kline_at.get("5m"), "BINANCE_FUTURES_REST", f"5m closed candles · {len(s.timeframe_klines.get('5m', ())) } rows"), "klines_15m": feed(kline_15_status, s.last_timeframe_kline_at.get("15m"), "BINANCE_FUTURES_REST", f"15m closed candles · {len(s.timeframe_klines.get('15m', ())) } rows"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "intelligence": feed(intelligence_status, s.last_book_at, "LOCAL_LIQUIDITY_INTELLIGENCE", f"tracked_walls={len(s.intelligence.walls)} base_levels={len(s.intelligence.levels)} detector_latency_ms={s.intelligence.last_latency_ms:.2f} reconciliation_error={s.intelligence.reconciliation_error():.4f}", "HEURISTIC_SCORES_UNCALIBRATED"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions", "UNAVAILABLE")}
+        critical = ("trades", "orderbook", "klines", "klines_5m", "klines_15m", "open_interest", "funding", "liquidations"); missing = [key for key in critical if not feeds[key]["status"].startswith("LIVE")]
+        return {"overall": "LIVE" if not missing else "DEGRADED", "market": s.symbol, "venue": s.venue, "market_type": s.market, "decision_authorized": False, "feeds": feeds, "missing_data": missing + ["calibration"], "telegram": self.telegram.status(), "last_error": self.last_error, "generated_at": iso_ms(now) or ""}

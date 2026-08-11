@@ -62,6 +62,13 @@ async def snapshot(symbol: str) -> dict[str, Any]:
     payload = collector.state.snapshot(intelligence_trusted=trusted); payload["health"] = health; return payload
 
 
+@app.get("/api/v1/decision-brain")
+async def decision_brain() -> dict[str, Any]:
+    """Canonical timeframe decision output; scores are points, not probabilities."""
+    health = collector.health()
+    return {"symbol": settings.symbol, "decision_brain": collector.state.snapshot().get("decision_brain", {}), "health": health, "source": "BINANCE_FUTURES_MULTI_TIMEFRAME+TRADE+L2"}
+
+
 @app.get("/api/v1/orderbook/live")
 async def live_orderbook() -> dict[str, Any]:
     state = collector.state; health = collector.health(); trusted = health["feeds"]["orderbook"]["status"] == "LIVE" and health["feeds"]["trades"]["status"] == "LIVE"; return {"status": health["feeds"]["orderbook"]["status"], "symbol": settings.symbol, "market": "USD_M_FUTURES", "book": state.orderbook.metrics(), "intelligence": state.intelligence.snapshot(state.orderbook, list(state.klines), list(state.buckets.values()), state.price, now_ms(), data_integrity_ok=trusted), "received_at": state.orderbook.last_event_at}
@@ -94,12 +101,8 @@ async def capital_flow(tf: str = Query("5m")) -> dict[str, Any]:
 @app.get("/api/v1/liquidations/recent")
 @app.get("/api/v1/liquidation/heatmap")
 async def liquidations() -> dict[str, Any]:
-    state = collector.state; observed = list(state.liquidations); price = state.mark_price or state.price
-    estimated = []
-    if price and state.open_interest:
-        for distance in (-.025, -.018, -.012, -.008, .008, .012, .018, .025):
-            estimated.append({"price": price * (1 + distance), "size_btc": max(25, state.open_interest * .00035 * (1 - abs(distance) * 8)), "method": "OI_LEVERAGE_PRIOR", "status": "ESTIMATED"})
-    return {"symbol": settings.symbol, "observed_status": collector.health()["feeds"]["liquidations"]["status"], "observed": observed, "estimated": estimated, "historical": [], "methodology": {"observed": "Binance forceOrder", "estimated": "OI cohort + leverage prior", "historical": "UNAVAILABLE"}}
+    state = collector.state; health = collector.health(); brain = state.snapshot().get("decision_brain", {}); heatmap = brain.get("liquidation_heatmap", {})
+    return {"symbol": settings.symbol, "observed_status": health["feeds"]["liquidations"]["status"], "observed": heatmap.get("observed", list(state.liquidations)), "estimated": heatmap.get("estimated", []), "historical": [], "methodology": {"observed": "Binance forceOrder", "estimated": heatmap.get("methodology", "N/A"), "historical": "UNAVAILABLE"}, "estimated_label": "ESTIMATED — never confirmed account liquidation"}
 
 
 @app.get("/api/v1/probability-map/summary")

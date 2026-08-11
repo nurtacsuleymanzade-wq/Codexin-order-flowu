@@ -196,6 +196,7 @@ class MarketState:
     liquidation_connected_at: int | None = None
     last_liquidation_at: int | None = None
     cvd: float = 0
+    cvd_history: deque[tuple[int, float]] = field(default_factory=lambda: deque(maxlen=120))
     vwap_pv: float = 0
     vwap_notional: float = 0
     trade_count: int = 0
@@ -203,11 +204,18 @@ class MarketState:
     liquidations: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
     buckets: dict[int, dict[str, Any]] = field(default_factory=dict)
     klines: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
+    timeframe_klines: dict[str, deque[dict[str, Any]]] = field(default_factory=lambda: {"1m": deque(maxlen=500), "5m": deque(maxlen=500), "15m": deque(maxlen=500)})
+    last_timeframe_kline_at: dict[str, int | None] = field(default_factory=lambda: {"1m": None, "5m": None, "15m": None})
+    oi_delta: float | None = None
+    previous_open_interest: float | None = None
     intelligence: Any = field(default=None, repr=False)
+    decision_brain: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         from .intelligence import LiquidityIntelligenceEngine
+        from .decision_brain import DecisionBrain
         self.intelligence = LiquidityIntelligenceEngine(self.symbol)
+        self.decision_brain = DecisionBrain()
 
     def trade(self, event: dict[str, Any], received_at: int | None = None) -> dict[str, Any]:
         received = received_at or now_ms()
@@ -217,6 +225,7 @@ class MarketState:
         item = {"event_time": event_time, "received_time": received, "price": price, "quantity": quantity, "notional": notional, "side": "BUY" if buy else "SELL", "trade_id": event.get("t") or event.get("a"), "source": "BINANCE_FUTURES_TRADE"}
         self.price = price; self.last_trade_at = received; self.last_ws_at = received; self.trade_count += 1
         self.cvd += notional if buy else -notional
+        self.cvd_history.append((received, self.cvd))
         self.vwap_pv += price * notional; self.vwap_notional += notional
         self.trades.appendleft(item)
         self.intelligence.on_trade(item, received)
@@ -234,13 +243,19 @@ class MarketState:
         self.last_liquidation_at = received; self.last_ws_at = received; self.liquidations.appendleft(item)
         return item
 
-    def update_kline(self, row: dict[str, Any], received_at: int | None = None) -> None:
-        self.last_kline_at = received_at or now_ms()
-        existing = next((index for index, item in enumerate(self.klines) if item["time"] == row["time"]), None)
+    def update_kline(self, row: dict[str, Any], received_at: int | None = None, timeframe: str = "1m") -> None:
+        received = received_at or now_ms()
+        self.last_timeframe_kline_at[timeframe] = received
+        if timeframe == "1m":
+            self.last_kline_at = received
+        target = self.timeframe_klines.setdefault(timeframe, deque(maxlen=500))
+        existing = next((index for index, item in enumerate(target) if item["time"] == row["time"]), None)
         if existing is None:
-            self.klines.append(row)
+            target.append(row)
         else:
-            items = list(self.klines); items[existing] = row; self.klines.clear(); self.klines.extend(items)
+            items = list(target); items[existing] = row; target.clear(); target.extend(items)
+        if timeframe == "1m":
+            self.klines.clear(); self.klines.extend(target)
 
     def age(self, timestamp: int | None, current: int | None = None) -> int | None:
         if timestamp is None:
@@ -253,15 +268,17 @@ class MarketState:
         trade_fresh = self.last_trade_at is not None and self.age(self.last_trade_at, current) <= 3000
         trusted = book_fresh and trade_fresh if intelligence_trusted is None else intelligence_trusted
         intelligence = self.intelligence.snapshot(self.orderbook, list(self.klines), list(self.buckets.values()), self.price, current, data_integrity_ok=trusted) if self.intelligence else {"status": "UNAVAILABLE"}
+        decision_brain = self.decision_brain.evaluate(self, current) if self.decision_brain else {"status": "UNAVAILABLE", "final_decision": "NO TRADE"}
         return {
             "market": {"venue": self.venue, "market": self.market, "symbol": self.symbol, "market_type": "PERPETUAL"},
             "price": {"last": self.price, "mark": self.mark_price, "index": self.index_price, "best_bid": self.best_bid, "best_ask": self.best_ask},
             "flow": {"cvd": self.cvd, "vwap": self.vwap_pv / self.vwap_notional if self.vwap_notional else None, "trade_count": self.trade_count, "buckets": list(self.buckets.values())[-500:]},
-            "derivatives": {"open_interest": self.open_interest, "funding_rate": self.funding_rate, "positioning": self.ratio},
+            "derivatives": {"open_interest": self.open_interest, "open_interest_change": self.oi_delta, "funding_rate": self.funding_rate, "positioning": self.ratio},
             "orderbook": {**metrics, "age_ms": self.age(self.last_book_at)},
             "liquidations": {"recent": list(self.liquidations)[:50], "age_ms": self.age(self.last_liquidation_at)},
-            "candles": {"rows": list(self.klines)[-200:], "age_ms": self.age(self.last_kline_at)},
+            "candles": {"rows": list(self.klines)[-200:], "age_ms": self.age(self.last_kline_at), "timeframes": {key: list(value)[-200:] for key, value in self.timeframe_klines.items()}},
             "freshness": {"trade_age_ms": self.age(self.last_trade_at), "book_age_ms": self.age(self.last_book_at), "oi_age_ms": self.age(self.last_oi_at), "funding_age_ms": self.age(self.last_funding_at)},
             "intelligence": intelligence,
+            "decision_brain": decision_brain,
             "received_at": iso_ms(current),
         }

@@ -19,6 +19,10 @@ class Settings:
     oi_sla_ms: int = int(os.getenv("CODEXIN_OI_SLA_MS", "60000"))
     funding_sla_ms: int = int(os.getenv("CODEXIN_FUNDING_SLA_MS", "7200000"))
     liquidation_sla_ms: int = int(os.getenv("CODEXIN_LIQUIDATION_SLA_MS", "5000"))
+    min_rr: float = float(os.getenv("CODEXIN_MIN_RR", "1.5"))
+    telegram_bot_token: str | None = os.getenv("CODEXIN_TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str | None = os.getenv("CODEXIN_TELEGRAM_CHAT_ID")
+    telegram_enabled: bool = os.getenv("CODEXIN_TELEGRAM_ENABLED", "true").lower() == "true"
 
 
 settings = Settings()

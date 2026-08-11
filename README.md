@@ -19,6 +19,9 @@ Market-data-first BTCUSDT USD-M Futures research terminal.
 - Multi-timeframe chart intelligence: VWAP, CVD, delta, volume, RSI, MACD, POC/HVN/LVN, VAH/VAL, TPO, premium/discount/equilibrium and HH/HL/LH/LL/BOS/CHOCH/MSB overlays with user toggles
 - Explicit stale-data suppression and calibration guards: target probability is `UNTRAINED` and ETTT is `INSUFFICIENT SAMPLE` until replayable out-of-sample calibration exists
 - Execution, liquidity, derivatives, context and data-health workspaces
+- Central Decision Brain: 15m market regime → 5m direction/location → 1m setup → 1s confirmation/position monitor
+- Structural entry/invalidation, natural liquidity target, observed L2 path and non-calibrated point scores
+- Telegram read-only setup reporting with environment-only credentials; no execution commands are sent
 
 The frontend intentionally has no Spot fallback. If a critical feed is missing or its sequence is invalid, the decision gate stays locked to `NO TRADE`.
 
@@ -51,6 +54,7 @@ The API exposes the canonical contracts at:
 - `GET /api/v1/live/BTCUSDT/futures/snapshot`
 - `GET /api/v1/orderbook/live`
 - `GET /api/v1/orderbook/intelligence?timeframe=1m`
+- `GET /api/v1/decision-brain`
 - `GET /api/v1/flow/summary?tf=5m`
 - `GET /api/v1/liquidations/recent`
 - `GET /api/v1/probability-map/summary?tf=5m`
@@ -67,6 +71,22 @@ The published site now defaults to the production API gateway at
 backend's canonical `/api/v1` contract internally. Supplying `api=` overrides
 the gateway for local or staging environments. The frontend never falls back
 from Futures to Spot.
+
+### Telegram setup reports
+
+The collector sends a de-duplicated report when a `LONG SETUP`, `SHORT SETUP`,
+`LONG ENTRY CONFIRMED` or `SHORT ENTRY CONFIRMED` state appears. Configure the
+credentials outside the repository; the token is never placed in frontend
+JavaScript or returned by the API:
+
+```bash
+sudo install -m 600 deploy/codexin-order-flow.secrets.env.example /etc/codexin-order-flow/secrets.env
+# edit the two CODEXIN_TELEGRAM_* values in that file
+sudo systemctl restart codexin-order-flow
+```
+
+Without both variables, Telegram status is `configured=false` and the brain
+continues without inventing a delivery result.
 
 ## Data integrity rules
 
