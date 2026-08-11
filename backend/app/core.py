@@ -54,7 +54,11 @@ class LocalOrderBook:
         if self.last_update_id is None:
             return -1
         for index, event in enumerate(events):
-            if int(event.get("U", 0)) <= self.last_update_id + 1 and int(event.get("u", 0)) >= self.last_update_id:
+            # The first usable event must cover lastUpdateId + 1. An event
+            # ending exactly at the REST snapshot is stale and must be
+            # discarded; accepting it leaves the book invalid forever when
+            # the next event starts at snapshot + 1.
+            if int(event.get("U", 0)) <= self.last_update_id + 1 and int(event.get("u", 0)) >= self.last_update_id + 1:
                 return index
         return -1
 

@@ -56,7 +56,11 @@ To point the static frontend at a deployed backend, append its versioned API bas
 https://nurtacsuleymanzade-wq.github.io/Codexin-order-flowu/?api=https://api.example.com/api/v1
 ```
 
-Without `api=`, the frontend uses its safe direct read-only Binance fallback. It never falls back from Futures to Spot.
+The published site now defaults to the production API gateway at
+`https://nce-api.78.46.134.148.sslip.io/api/v2`. The gateway preserves the
+backend's canonical `/api/v1` contract internally. Supplying `api=` overrides
+the gateway for local or staging environments. The frontend never falls back
+from Futures to Spot.
 
 ## Data integrity rules
 
@@ -68,6 +72,10 @@ Without `api=`, the frontend uses its safe direct read-only Binance fallback. It
 6. Historical calibration is explicitly unavailable until a verified replayable history is connected.
 7. This project does not place trades.
 
-## Production roadmap
+## Production status
 
-The browser release is deliberately read-only and now includes a verified live-data vertical slice. A production deployment should still move raw ingestion, event validation, ClickHouse history, Redis snapshots, monitoring, authentication and model calibration into separate backend services before adding live execution.
+The VPS deployment runs the collector as a restartable systemd service behind
+Nginx, with Redis snapshot publishing and an append-only hash-chained raw-event
+archive. The decision gate remains read-only and locked until calibration data
+is verified. ClickHouse history, macro/news ingestion and calibration are
+intentionally marked unavailable rather than fabricated.
