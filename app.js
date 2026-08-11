@@ -24,9 +24,12 @@ const state = {
   lastWsAt: 0, liquidationConnectedAt: 0, tradeCount: 0, errors: 0,
   cvd: 0, vwapPV: 0, vwapVolume: 0, events: [], trades: [],
   liquidations: [], buckets: new Map(), profile: new Map(), klines: [],
+  lifecycle: new Map(), lastBookSyncAt: 0, lastDepthEventAt: 0,
+  lastBookEventTime: 0, lastTickerEventTime: 0,
+  aggression: { buy: 0, sell: 0, count: 0, volume: 0 },
   book: { bids: new Map(), asks: new Map(), lastUpdateId: null, lastEventId: null,
     valid: false, resyncs: 0, queue: [], syncing: false, renderQueued: false },
-  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, chart: null, candleSeries: null,
+  ws: null, wsConnected: false, reconnects: 0, uiRenderScheduled: false, backendHealth: null, directFallbackStarted: false, chart: null, candleSeries: null,
   volumeSeries: null
 };
 
@@ -61,7 +64,7 @@ async function json(url, options = {}) {
 }
 
 async function pollBackendSnapshot() {
-  if (!CONFIG.backend) return;
+  if (!CONFIG.backend || state.directFallbackStarted) return;
   try {
     const snapshot = await json(`${CONFIG.backend}/live/${CONFIG.symbol}/futures/snapshot`, { timeout: 5000 });
     state.backendHealth = snapshot.health || await json(`${CONFIG.backend}/health`, { timeout: 5000 });
@@ -71,11 +74,20 @@ async function pollBackendSnapshot() {
     state.buckets = new Map((flow.buckets || []).map(bucket => [Number(bucket.time), bucket]));
     state.klines = (snapshot.candles?.rows || []).map(row => ({ time: Number(row.time), open: Number(row.open), high: Number(row.high), low: Number(row.low), close: Number(row.close), volume: Number(row.volume), closed: Boolean(row.closed) }));
     state.liquidations = snapshot.liquidations?.recent || [];
-    if (orderbook.bids && orderbook.asks) { state.book.bids = new Map(orderbook.bids.map(row => [String(row.price), Number(row.quantity)])); state.book.asks = new Map(orderbook.asks.map(row => [String(row.price), Number(row.quantity)])); state.book.lastUpdateId = orderbook.sequence; state.book.valid = Boolean(orderbook.valid); }
-    const age = value => value == null ? 0 : Math.max(1, Date.now() - Number(value)); state.lastTradeAt = age(freshness.trade_age_ms); state.lastBookAt = age(freshness.book_age_ms); state.lastKlineAt = age(snapshot.candles?.age_ms); state.lastOiAt = age(freshness.oi_age_ms); state.lastFundingAt = age(freshness.funding_age_ms); state.lastWsAt = Date.now();
+    if (orderbook.bids && orderbook.asks) {
+      const nextBids = orderbook.bids.map(row => [String(row.price), Number(row.quantity)]), nextAsks = orderbook.asks.map(row => [String(row.price), Number(row.quantity)]);
+      for (const price of state.book.bids.keys()) if (!nextBids.some(row => row[0] === price)) trackDepthSide("bid", [[price, 0]]);
+      for (const price of state.book.asks.keys()) if (!nextAsks.some(row => row[0] === price)) trackDepthSide("ask", [[price, 0]]);
+      trackDepthSide("bid", nextBids); trackDepthSide("ask", nextAsks);
+      state.book.bids = new Map(nextBids); state.book.asks = new Map(nextAsks); state.book.lastUpdateId = orderbook.sequence; state.book.valid = Boolean(orderbook.valid); state.lastBookAt = Date.now();
+    }
+    const age = value => value == null ? 0 : Math.max(1, Date.now() - Number(value)); state.lastTradeAt = freshness.trade_age_ms == null ? state.lastTradeAt : Date.now() - Number(freshness.trade_age_ms); state.lastBookAt = freshness.book_age_ms == null ? state.lastBookAt : Date.now() - Number(freshness.book_age_ms); state.lastKlineAt = snapshot.candles?.age_ms == null ? state.lastKlineAt : Date.now() - Number(snapshot.candles.age_ms); state.lastOiAt = freshness.oi_age_ms == null ? state.lastOiAt : Date.now() - Number(freshness.oi_age_ms); state.lastFundingAt = freshness.funding_age_ms == null ? state.lastFundingAt : Date.now() - Number(freshness.funding_age_ms);
     setFeed("trades", state.backendHealth.feeds?.trades?.status || "WAITING"); setFeed("orderbook", state.backendHealth.feeds?.orderbook?.status || "WAITING");
     renderAll();
-  } catch (error) { state.errors += 1; log(`Backend snapshot unavailable: ${error.message}`, "warn"); }
+  } catch (error) {
+    state.backendHealth = null; state.errors += 1; log(`Backend snapshot unavailable: ${error.message}`, "warn");
+    if (!state.directFallbackStarted) { state.directFallbackStarted = true; log("Falling back to direct Binance Futures browser feed", "warn"); Promise.all([loadHistory(), loadDerivatives()]).finally(() => { openStream(); setInterval(loadDerivatives, 30000); setInterval(pollKline, 5000); pollKline(); }); }
+  }
 }
 
 function streamUrl() {
@@ -83,7 +95,8 @@ function streamUrl() {
     `${CONFIG.lower}@trade`,
     `${CONFIG.lower}@depth@100ms`,
     `${CONFIG.lower}@bookTicker`,
-    `${CONFIG.lower}@forceOrder`
+    `${CONFIG.lower}@forceOrder`,
+    `${CONFIG.lower}@markPrice@1s`
   ].join("/");
 }
 
@@ -149,22 +162,39 @@ function applyDepth(event) {
   const b = state.book;
   const finalId = Number(event.u);
   if (!Number.isFinite(finalId)) return false;
+  if ((b.lastEventId !== null && finalId <= b.lastEventId) || (b.lastEventId === null && b.lastUpdateId !== null && finalId <= b.lastUpdateId)) return true;
   if (b.lastEventId !== null) {
     if (event.pu !== undefined && Number(event.pu) !== b.lastEventId) return false;
+    if (event.pu === undefined && Number(event.U) > b.lastEventId + 1) return false;
   } else if (b.lastUpdateId !== null && Number(event.U) > b.lastUpdateId + 1) {
     return false;
   }
-  for (const [price, quantity] of event.b || []) {
-    const key = String(price), value = Number(quantity);
-    if (value === 0) b.bids.delete(key); else b.bids.set(key, value);
-  }
-  for (const [price, quantity] of event.a || []) {
-    const key = String(price), value = Number(quantity);
-    if (value === 0) b.asks.delete(key); else b.asks.set(key, value);
-  }
+  trackDepthSide("bid", event.b || []); trackDepthSide("ask", event.a || []);
   b.lastUpdateId = finalId; b.lastEventId = finalId; b.valid = true;
-  state.lastBookAt = Date.now();
+  state.lastBookAt = Date.now(); state.lastDepthEventAt = state.lastBookAt; state.lastBookEventTime = Number(event.E || event.T || state.lastBookAt);
   return true;
+}
+
+function lifecycleKey(side, price) { return `${side}:${price}`; }
+function trackDepthSide(side, updates, snapshot = false) {
+  const map = side === "bid" ? state.book.bids : state.book.asks;
+  const now = Date.now();
+  for (const [price, rawQuantity] of updates) {
+    const key = String(price), quantity = Number(rawQuantity), old = Number(map.get(key) || 0);
+    const id = lifecycleKey(side, key);
+    let level = state.lifecycle.get(id);
+    if (!level) level = { side, price: Number(price), firstSeen: now, lastSeen: now, lastAddedAt: now, addCount: 0, removeCount: 0, refillCount: 0, visibleQuantity: 0, peakQuantity: 0, addedQuantity: 0, removedQuantity: 0, replenishedQuantity: 0, consumedQuantity: 0, pulledQuantity: 0, visible: false };
+    level.lastSeen = now;
+    if (quantity > 0) {
+      if (!old) { level.firstSeen = level.firstSeen || now; level.addCount += 1; level.lastAddedAt = now; level.addedQuantity += quantity; }
+      else if (quantity > old) { const add = quantity - old; level.addCount += 1; level.lastAddedAt = now; level.addedQuantity += add; level.refillCount += 1; level.replenishedQuantity += add; }
+      else if (quantity < old) { const removed = old - quantity; level.removeCount += 1; level.removedQuantity += removed; level.consumedQuantity += removed; }
+      level.visibleQuantity = quantity; level.peakQuantity = Math.max(level.peakQuantity, quantity); level.visible = true; map.set(key, quantity);
+    } else if (old > 0) {
+      level.removeCount += 1; level.removedQuantity += old; level.pulledQuantity += old; level.visibleQuantity = 0; level.visible = false; map.delete(key);
+    }
+    state.lifecycle.set(id, level);
+  }
 }
 
 async function syncBook() {
@@ -175,6 +205,9 @@ async function syncBook() {
     const snapshot = await json(`${CONFIG.rest}/depth?symbol=${CONFIG.symbol}&limit=1000`, { timeout: 8000 });
     b.bids = new Map(snapshot.bids.map(row => [String(row[0]), Number(row[1])]).filter(row => row[1] > 0));
     b.asks = new Map(snapshot.asks.map(row => [String(row[0]), Number(row[1])]).filter(row => row[1] > 0));
+    const syncedAt = Date.now(); state.lastBookSyncAt = syncedAt;
+    for (const [price, quantity] of b.bids) trackDepthSide("bid", [[price, quantity]], true);
+    for (const [price, quantity] of b.asks) trackDepthSide("ask", [[price, quantity]], true);
     b.lastUpdateId = Number(snapshot.lastUpdateId); b.lastEventId = null; b.valid = false;
     const buffered = b.queue.splice(0);
     const first = buffered.findIndex(event => Number(event.U) <= b.lastUpdateId + 1 && Number(event.u) >= b.lastUpdateId);
@@ -223,6 +256,7 @@ function onTrade(event) {
   const buy = !event.m, timestamp = Number(event.T) || Date.now();
   state.price = price; state.lastTradeAt = Date.now(); state.tradeCount += 1;
   state.cvd += buy ? notional : -notional;
+  state.aggression[buy ? "buy" : "sell"] += notional; state.aggression.count += 1; state.aggression.volume += quantity;
   state.vwapPV += price * notional; state.vwapVolume += notional;
   state.trades.unshift({ price, quantity, notional, buy, timestamp });
   state.trades = state.trades.slice(0, CONFIG.maxTrades);
@@ -266,7 +300,7 @@ function onKline(event) {
 function onBookTicker(event) {
   const bid = Number(event.b), ask = Number(event.a);
   if (!bid || !ask) return;
-  state.price = (bid + ask) / 2; state.lastTickerAt = Date.now();
+  state.price = (bid + ask) / 2; state.lastTickerAt = Date.now(); state.lastTickerEventTime = Number(event.E || event.T || state.lastTickerAt);
   setText("best-bid", fmt(bid)); setText("best-ask", fmt(ask)); setText("spread-value", `${((ask - bid) / state.price * 10000).toFixed(2)} bp`); scheduleUiRender();
 }
 
@@ -314,11 +348,16 @@ function bookMetrics() {
   const b = state.book; if (!b.valid) return { valid: false };
   const bids = [...b.bids.entries()].map(([price, quantity]) => ({ p: Number(price), q: quantity })).sort((a, c) => c.p - a.p);
   const asks = [...b.asks.entries()].map(([price, quantity]) => ({ p: Number(price), q: quantity })).sort((a, c) => a.p - c.p);
+  if (!bids.length || !asks.length || bids[0].p >= asks[0].p) return { valid: false, reason: "best bid must be below best ask" };
   const mid = (bids[0]?.p + asks[0]?.p) / 2 || state.price, range = mid * 0.001;
   const bid10 = bids.filter(row => row.p >= mid - range).reduce((sum, row) => sum + row.p * row.q, 0);
   const ask10 = asks.filter(row => row.p <= mid + range).reduce((sum, row) => sum + row.p * row.q, 0);
-  const total = bid10 + ask10;
-  return { valid: true, bids, asks, bid10, ask10, bidShare: total ? bid10 / total * 100 : 50, askShare: total ? ask10 / total * 100 : 50, imbalance: total ? (bid10 - ask10) / total * 100 : 0, mid, spread: asks[0]?.p - bids[0]?.p };
+  const bidBtc = bids.reduce((sum, row) => sum + row.q, 0), askBtc = asks.reduce((sum, row) => sum + row.q, 0);
+  const bidNotional = bids.reduce((sum, row) => sum + row.p * row.q, 0), askNotional = asks.reduce((sum, row) => sum + row.p * row.q, 0), total = bidNotional + askNotional;
+  const weighted = rows => rows.reduce((sum, row) => sum + row.q * Math.exp(-Math.abs(row.p - mid) / (mid * 0.002)), 0);
+  const weightedBid = weighted(bids), weightedAsk = weighted(asks), weightedTotal = weightedBid + weightedAsk;
+  const microprice = (asks[0].q * bids[0].p + bids[0].q * asks[0].p) / (bids[0].q + asks[0].q);
+  return { valid: true, bids, asks, bid10, ask10, bidBtc, askBtc, bidNotional, askNotional, bidLevels: bids.length, askLevels: asks.length, bidShare: total ? bidNotional / total * 100 : 50, askShare: total ? askNotional / total * 100 : 50, imbalance: total ? (bidNotional - askNotional) / total * 100 : 0, weightedImbalance: weightedTotal ? (weightedBid - weightedAsk) / weightedTotal * 100 : 0, microprice, mid, spread: asks[0]?.p - bids[0]?.p, spreadBps: (asks[0]?.p - bids[0]?.p) / mid * 10000 };
 }
 
 function renderHeader() {
@@ -357,7 +396,7 @@ function renderLiquidity(metrics = bookMetrics()) {
   const zones = estimatedZones(); setText("liq-nearest", zones[0] ? usd(zones[0].price) : "—");
   $("liquidity-bars").innerHTML = zones.length ? zones.map(zone => `<div class="liq-zone"><span class="zone-price">${usd(zone.price)}</span><span class="zone-bar" style="width:${Math.max(8, zone.size / zones[0].size * 100)}%"></span><span class="zone-size">${fmt(zone.size, 0)} BTC</span></div>`).join("") : `<div class="empty-state">Waiting for OI and mark price</div>`;
   const large = [...metrics.asks.slice(0, 20), ...metrics.bids.slice(0, 20)].filter(row => row.p * row.q > 250000).sort((a, b) => b.p * b.q - a.p * a.q).slice(0, 12);
-  $("large-orders-table").innerHTML = large.length ? large.map(row => `<tr><td class="${row.p > metrics.mid ? "sell-text" : "buy-text"}">${row.p > metrics.mid ? "ASK" : "BID"}</td><td>${usd(row.p)}</td><td>${usd(row.p * row.q)}</td><td>${((row.p - metrics.mid) / metrics.mid * 10000).toFixed(1)} bp</td><td>${ago(state.lastBookAt)}</td><td class="warning-text">UNCONFIRMED</td></tr>`).join("") : `<tr><td colspan="6" class="empty-state">No large validated resting orders in current range</td></tr>`;
+  $("large-orders-table").innerHTML = large.length ? large.map(row => { const life = lifecycleFor(row, row.p > metrics.mid ? "ask" : "bid"), lifetime = (Date.now() - Number(life.firstSeen || Date.now())) / 1000, pulledRatio = Number(life.pulledQuantity || 0) / Math.max(Number(life.removedQuantity || 0), 1), refillRatio = Number(life.replenishedQuantity || 0) / Math.max(Number(life.addedQuantity || 0), 1), status = pulledRatio > .7 && lifetime < 10 ? "SPOOF WATCH" : refillRatio > .25 ? "REPLENISHING WALL" : lifetime > 8 ? "PERSISTENT WALL" : "UNCONFIRMED"; return `<tr><td class="${row.p > metrics.mid ? "sell-text" : "buy-text"}">${row.p > metrics.mid ? "ASK" : "BID"}</td><td>${usd(row.p)}</td><td>${usd(row.p * row.q)}</td><td>${((row.p - metrics.mid) / metrics.mid * 10000).toFixed(1)} bp</td><td>${lifetime.toFixed(1)}s</td><td class="warning-text">${status}<br><span class="muted-cell">lifetime ${lifetime.toFixed(1)}s · pulled ${(pulledRatio * 100).toFixed(0)}% · refill ${(refillRatio * 100).toFixed(0)}% · price reaction UNAVAILABLE</span></td></tr>`; }).join("") : `<tr><td colspan="6" class="empty-state">No large validated resting orders in current range</td></tr>`;
 }
 
 function renderLiquidations() {
@@ -419,7 +458,7 @@ function feedRows() {
 }
 
 function renderHealth() {
-  const rows = state.backendHealth ? Object.entries(state.backendHealth.feeds || {}).map(([key, feed]) => ({ label: key.replaceAll("_", " ").toUpperCase(), status: feed.status === "LIVE_QUIET" ? "LIVE / QUIET" : feed.status, age: feed.age_ms, detail: `${feed.source} · ${feed.detail}` })) : feedRows();
+  const rows = state.backendHealth ? Object.entries(state.backendHealth.feeds || {}).map(([key, feed]) => ({ label: key.replaceAll("_", " ").toUpperCase(), status: feed.status === "LIVE_QUIET" ? "LIVE / QUIET" : feed.status, age: feed.age_ms, detail: `${feed.source} · ${feed.methodology || "OBSERVED"} · ${feed.confidence || "REAL"} · ${feed.detail}${feed.timestamp ? ` · event ${feed.timestamp}` : ""}` })) : feedRows();
   const critical = rows.slice(0, 6), degraded = critical.some(row => !row.status.startsWith("LIVE"));
   setText("health-pill", degraded ? "DEGRADED" : "LIVE"); setClass("health-pill", `pill ${degraded ? "warning" : ""}`);
   $("health-grid").innerHTML = rows.map(row => `<div class="health-card ${row.status.startsWith("LIVE") ? "good" : "warn"}"><div class="health-title"><h3>${row.label}</h3><span class="health-state ${row.status.startsWith("LIVE") ? "good-text" : "warning-text"}">${row.status}</span></div><div class="health-meta"><span>${esc(row.detail)}</span><span class="health-age">${row.age == null ? "age —" : `age ${(row.age / 1000).toFixed(1)}s`}</span></div></div>`).join("");
@@ -440,7 +479,113 @@ function renderDecision() {
   $("decision-checks").innerHTML = checks.map(check => `<div class="check-row"><span>${check.label}</span><b class="${check.ok ? "ok" : "bad"}">${check.value}</b></div>`).join(""); setText("decision-reason", "Observed flow is displayed. Historical calibration is unavailable; execution remains locked.");
 }
 
-function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); }
+const SIZE_BUCKETS = [[0, 10, "0–10 BTC"], [10, 20, "10–20 BTC"], [20, 50, "20–50 BTC"], [50, 100, "50–100 BTC"], [100, 150, "100–150 BTC"], [150, 300, "150–300 BTC"], [300, Infinity, "300+ BTC"]];
+function intelligenceFresh(metrics) {
+  const now = Date.now(), backendFeeds = state.backendHealth?.feeds;
+  const bookLive = backendFeeds ? String(backendFeeds.orderbook?.status || "").startsWith("LIVE") && state.lastBookAt && now - state.lastBookAt < CONFIG.freshness.book : state.book.valid && now - state.lastBookAt < CONFIG.freshness.book;
+  const tradeLive = backendFeeds ? String(backendFeeds.trades?.status || "").startsWith("LIVE") && state.lastTradeAt && now - state.lastTradeAt < CONFIG.freshness.trade : state.lastTradeAt && now - state.lastTradeAt < CONFIG.freshness.trade;
+  const wsLive = backendFeeds ? bookLive && tradeLive : state.wsConnected && now - state.lastWsAt < CONFIG.freshness.ws;
+  return Boolean(metrics.valid && bookLive && tradeLive && wsLive);
+}
+
+function lifecycleFor(row, side) {
+  return state.lifecycle.get(lifecycleKey(side, String(row.p))) || { firstSeen: state.lastBookSyncAt || Date.now(), lastAddedAt: state.lastBookSyncAt || Date.now(), addCount: 0, removeCount: 0, refillCount: 0, addedQuantity: 0, removedQuantity: 0, replenishedQuantity: 0, consumedQuantity: 0, pulledQuantity: 0, visibleQuantity: row.q, peakQuantity: row.q, lastSeen: Date.now() };
+}
+
+function summarizeLevels(rows, side, now = Date.now()) {
+  const levels = rows.map(row => ({ ...row, life: lifecycleFor(row, side) }));
+  const btc = levels.reduce((sum, row) => sum + row.q, 0), notional = levels.reduce((sum, row) => sum + row.p * row.q, 0);
+  const lifetimes = levels.map(row => Math.max(0, now - Number(row.life.firstSeen || now)));
+  const base = state.mark || state.price || levels[0]?.p || 1, distances = levels.map(row => Math.abs(row.p - base) / base * 10000);
+  return { levels, count: levels.length, btc, notional, added: levels.reduce((s, r) => s + Number(r.life.addedQuantity || 0), 0), removed: levels.reduce((s, r) => s + Number(r.life.removedQuantity || 0), 0), replenished: levels.reduce((s, r) => s + Number(r.life.replenishedQuantity || 0), 0), pulled: levels.reduce((s, r) => s + Number(r.life.pulledQuantity || 0), 0), oldest: lifetimes.length ? Math.max(...lifetimes) : 0, newest: levels.length ? Math.min(...levels.map(row => now - Number(row.life.lastAddedAt || now))) : 0, averageLifetime: lifetimes.length ? lifetimes.reduce((s, v) => s + v, 0) / lifetimes.length : 0, nearestBps: distances.length ? Math.min(...distances) : null, averageDistanceBps: distances.length ? distances.reduce((s, v) => s + v, 0) / distances.length : null, largest: levels.sort((a, b) => b.q - a.q)[0] || null };
+}
+
+function bucketSummaries(metrics) {
+  return SIZE_BUCKETS.map(([min, max, label]) => {
+    const bid = summarizeLevels(metrics.bids.filter(row => row.q >= min && row.q < max), "bid"), ask = summarizeLevels(metrics.asks.filter(row => row.q >= min && row.q < max), "ask");
+    const total = bid.btc + ask.btc;
+    return { min, max, label, bid, ask, dominance: total ? (bid.btc - ask.btc) / total * 100 : 0 };
+  });
+}
+
+function clusterSummaries(metrics) {
+  const current = state.mark || state.price || metrics.mid, step = current * 0.0005, structure = marketStructure(), clusters = [];
+  for (const [side, rows] of [["BID", metrics.bids.filter(row => row.p < current)], ["ASK", metrics.asks.filter(row => row.p > current)]]) {
+    const groups = new Map();
+    rows.slice(0, 180).forEach(row => { const key = Math.round((row.p - current) / step); const group = groups.get(key) || []; group.push(row); groups.set(key, group); });
+    for (const [key, group] of groups) {
+      const summary = summarizeLevels(group, side === "BID" ? "bid" : "ask"), low = Math.min(...group.map(row => row.p)), high = Math.max(...group.map(row => row.p)), notional = summary.notional;
+      if (!notional) continue;
+      const life = summary.averageLifetime / 1000, removedRatio = summary.removed / Math.max(summary.added, summary.added + summary.removed, 1), replenishment = summary.replenished / Math.max(summary.added, 1);
+      let status = "UNCONFIRMED";
+      if (removedRatio > .7 && life < 10) status = "SPOOF_WATCH";
+      else if (replenishment > .25) status = "REPLENISHING_WALL";
+      else if (life > 8 && summary.largest?.q > Math.max(10, current * 0.00001)) status = "PERSISTENT_WALL";
+      clusters.push({ side, low, high, price: side === "ASK" ? low : high, distancePct: Math.abs((side === "ASK" ? low : high) - current) / current * 100, distanceBps: Math.abs((side === "ASK" ? low : high) - current) / current * 10000, distanceAtr: structure.atr ? Math.abs((side === "ASK" ? low : high) - current) / structure.atr : null, btc: summary.btc, notional, density: notional / Math.max(high - low, current * .0001), persistence: life, replenishment, depletion: summary.removed, status, summary });
+    }
+  }
+  return clusters.sort((a, b) => a.distanceBps - b.distanceBps);
+}
+
+function recentFlow() {
+  const cutoff = Date.now() - 60000, trades = state.trades.filter(row => row.timestamp >= cutoff);
+  if (trades.length) return { buy: trades.filter(row => row.buy).reduce((s, r) => s + r.notional, 0), sell: trades.filter(row => !row.buy).reduce((s, r) => s + r.notional, 0), count: trades.length, volume: trades.reduce((s, r) => s + r.quantity, 0) };
+  const rows = [...state.buckets.values()].filter(row => row.time >= cutoff);
+  return { buy: rows.reduce((s, r) => s + Number(r.buy || 0), 0), sell: rows.reduce((s, r) => s + Number(r.sell || 0), 0), count: rows.reduce((s, r) => s + Number(r.count || 0), 0), volume: 0 };
+}
+
+function marketStructure() {
+  const rows = state.klines.filter(row => row.closed).slice(-40), recent = rows.slice(-20), previous = rows.slice(-40, -20), current = state.price || state.mark || rows.at(-1)?.close;
+  if (!recent.length || !current) return { atr: null, swingHigh: null, swingLow: null, equalHigh: null, equalLow: null, label: "UNAVAILABLE" };
+  const tr = recent.map((row, i) => { const prior = recent[i - 1]?.close || row.open; return Math.max(row.high - row.low, Math.abs(row.high - prior), Math.abs(row.low - prior)); }), atr = tr.reduce((s, value) => s + value, 0) / tr.length, swingHigh = Math.max(...recent.map(row => row.high)), swingLow = Math.min(...recent.map(row => row.low)), highs = [...recent].sort((a, b) => b.high - a.high), lows = [...recent].sort((a, b) => a.low - b.low), equalHigh = highs[1] && Math.abs(highs[0].high - highs[1].high) / highs[0].high < .001 ? (highs[0].high + highs[1].high) / 2 : null, equalLow = lows[1] && Math.abs(lows[0].low - lows[1].low) / lows[0].low < .001 ? (lows[0].low + lows[1].low) / 2 : null, previousHigh = previous.length ? Math.max(...previous.map(row => row.high)) : null, previousLow = previous.length ? Math.min(...previous.map(row => row.low)) : null;
+  return { atr, swingHigh, swingLow, equalHigh, equalLow, bos: previousHigh && current > previousHigh ? "BOS_UP" : previousLow && current < previousLow ? "BOS_DOWN" : "NO_BOS", label: current > (rows.at(-2)?.close || current) ? "HH/HL BIAS" : current < (rows.at(-2)?.close || current) ? "LH/LL BIAS" : "RANGE" };
+}
+
+function flowIntelligence(flow) {
+  const trades = state.trades.filter(row => row.timestamp >= Date.now() - 60000), volumes = [...state.buckets.values()].map(row => Number(row.buy || 0) + Number(row.sell || 0)).filter(value => value > 0).slice(-21), currentVolume = volumes.at(-1) || 0, history = volumes.slice(0, -1), mean = history.length ? history.reduce((s, v) => s + v, 0) / history.length : 0, sd = history.length > 1 ? Math.sqrt(history.reduce((s, v) => s + (v - mean) ** 2, 0) / history.length) : 0, z = sd ? (currentVolume - mean) / sd : null, threshold = Math.max(250000, trades.length ? trades.reduce((s, row) => s + row.notional, 0) / trades.length * 5 : 250000), whales = trades.filter(row => row.notional >= threshold).reduce((s, row) => s + row.notional * (row.buy ? 1 : -1), 0), first = trades.at(-1)?.price, last = trades.at(0)?.price;
+  return { delta: flow.buy - flow.sell, intensity: flow.count / 60, whaleFlow: whales, volumeZ: z, priceResponseBps: first && last ? (last - first) / first * 10000 : null };
+}
+
+function estimatedStopZones(metrics, clusters) {
+  const current = state.mark || state.price || metrics.mid, oi = Number(state.oi || 0), prior = oi ? oi * .00035 : null, structure = marketStructure();
+  const ask = clusters.find(row => row.side === "ASK"), bid = clusters.find(row => row.side === "BID"), above = [ask?.price, structure.equalHigh, structure.swingHigh].filter(price => price && price > current).sort((a, b) => a - b)[0], below = [bid?.price, structure.equalLow, structure.swingLow].filter(price => price && price < current).sort((a, b) => b - a)[0], askSize = ask?.price === above ? ask.btc : prior, bidSize = bid?.price === below ? bid.btc : prior;
+  const up = above ? { price: above, btc: askSize, source: `ESTIMATED · ${ask?.price === above ? "visible cluster" : "swing/equal high"} + OI/funding context` } : null;
+  const down = below ? { price: below, btc: bidSize, source: `ESTIMATED · ${bid?.price === below ? "visible cluster" : "swing/equal low"} + OI/funding context` } : null;
+  return { up, down };
+}
+
+function renderIntelligence() {
+  if (!$("intel-current-price")) return;
+  const metrics = bookMetrics(), shell = $("intel-shell"), stale = !intelligenceFresh(metrics), now = Date.now();
+  $("intel-stale").hidden = !stale; shell?.classList.toggle("suppressed", stale);
+  if (stale) {
+    setText("intel-health-label", metrics.valid ? "STALE DATA · OUTPUT SUPPRESSED" : "WAITING FOR VALIDATED FEEDS"); setText("intel-health-meta", `source BINANCE USD-M FUTURES · age ${ago(state.lastBookAt)} · sequence ${state.book.lastUpdateId || "—"}`); setClass("intel-health-dot", "status-dot bad"); setText("intel-summary-status", "STALE / SUPPRESSED");
+    ["intel-current-price","intel-short-zone","intel-long-zone","intel-pressure","intel-short-distance","intel-long-distance","intel-short-liquidity","intel-long-liquidity","intel-pressure-detail","intel-scenario-title","intel-scenario-text","intel-chain","intel-target","intel-invalidation"].forEach(id => setText(id, "—")); setText("intel-confirmation", "STALE"); setText("intel-pressure-pill", "STALE"); setClass("intel-confirmation", "pill warning"); setClass("intel-pressure-pill", "pill warning");
+    $("orderbook-summary-table").innerHTML = `<tr><td colspan="8" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; $("size-buckets-table").innerHTML = `<tr><td colspan="12" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; $("clusters-table").innerHTML = `<tr><td colspan="8" class="empty-state">STALE DATA — OUTPUT SUPPRESSED</td></tr>`; return;
+  }
+  const flow = recentFlow(), flowStats = flowIntelligence(flow), clusters = clusterSummaries(metrics), zones = estimatedStopZones(metrics, clusters), pressure = metrics.weightedImbalance, flowDelta = flowStats.delta, aligned = Math.sign(pressure) === Math.sign(flowDelta) && Math.abs(pressure) > 5 && flow.count > 0;
+  setClass("intel-health-dot", "status-dot good"); setText("intel-health-label", "VALIDATED FEEDS · LIVE"); setText("intel-health-meta", `source BINANCE USD-M FUTURES · age ${ago(state.lastBookAt)} · sequence ${state.book.lastUpdateId || "—"}`); setText("intel-summary-status", "LIVE / OBSERVED");
+  setText("intel-current-price", usd(state.price || metrics.mid)); setText("intel-price-context", `Mark ${usd(state.mark)} · Index ${usd(state.index)}`);
+  const pressureLabel = pressure > 5 ? "BID" : pressure < -5 ? "ASK" : "BALANCED"; setText("intel-pressure", pressureLabel); setText("intel-pressure-pill", pressureLabel); setText("intel-pressure-detail", `Weighted imbalance ${pressure >= 0 ? "+" : ""}${pressure.toFixed(1)}% · microprice ${fmt(metrics.microprice)}`); $("intel-pressure-fill").style.left = `${Math.max(2, Math.min(98, 50 + pressure / 2))}%`;
+  const confirmation = aligned ? "MIXED" : "UNCONFIRMED"; setText("intel-confirmation", confirmation); setClass("intel-confirmation", `pill ${aligned ? "warning" : "neutral"}`);
+  const zoneCard = (zone, priceId, distanceId, liqId) => { const base = state.price || metrics.mid; setText(priceId, zone ? usd(zone.price) : "UNAVAILABLE"); setText(distanceId, zone ? `Distance: ${((zone.price - base) / base * 100).toFixed(2)}% · ${(Math.abs(zone.price - base) / base * 10000).toFixed(1)} bps` : "Distance: UNAVAILABLE"); setText(liqId, zone ? `Estimated liquidity: ${fmt(zone.btc, 2)} BTC · ${usd(zone.price * zone.btc)} · ${zone.source}` : "Estimated liquidity: UNAVAILABLE"); };
+  zoneCard(zones.up, "intel-short-zone", "intel-short-distance", "intel-short-liquidity"); zoneCard(zones.down, "intel-long-zone", "intel-long-distance", "intel-long-liquidity");
+  const metricsHtml = [["Best bid", usd(metrics.bids[0]?.p), "OBSERVED · bookTicker/L2"],["Best ask", usd(metrics.asks[0]?.p), "OBSERVED · bookTicker/L2"],["Spread", `${fmt(metrics.spread)} · ${fmt(metrics.spreadBps, 2)} bps`, "DERIVED · best bid/ask"],["Visible bid", `${fmt(metrics.bidBtc, 2)} BTC · ${metrics.bidLevels} levels`, "REAL · aggregated L2"],["Visible ask", `${fmt(metrics.askBtc, 2)} BTC · ${metrics.askLevels} levels`, "REAL · aggregated L2"],["Depth notional", `${usd(metrics.bidNotional)} / ${usd(metrics.askNotional)}`, "DERIVED · full visible book"],["Bid/ask ratio", `${(metrics.bidBtc / Math.max(metrics.askBtc, 1)).toFixed(2)}x`, "DERIVED · visible BTC"],["Microprice", fmt(metrics.microprice), "DERIVED · top-of-book"],["Aggression", `${usd(flow.buy)} buy / ${usd(flow.sell)} sell`, "DERIVED · real trades · 60s"],["Delta / CVD", `${usd(flowStats.delta)} / ${usd(state.cvd)}`, "DERIVED · isBuyerMaker rule"],["Intensity / whale", `${fmt(flowStats.intensity, 2)} t/s · ${usd(flowStats.whaleFlow)}`, "DERIVED · thresholded trades"],["Price response / z", `${flowStats.priceResponseBps == null ? "—" : `${flowStats.priceResponseBps.toFixed(1)} bp`} · ${flowStats.volumeZ == null ? "—" : flowStats.volumeZ.toFixed(2)}`, "DERIVED · 60s / volume history"],["Data age", ago(Math.max(state.lastTradeAt || 0, state.lastBookAt || 0)), "RECEIVED · freshness SLA"],["Sequence gap", `${state.book.resyncs} resync(s)`, "VALIDATION · REST resync on gap"],["WebSocket", state.wsConnected || state.backendHealth ? "LIVE / CONNECTED" : "DISCONNECTED", "STATUS · Futures streams"],["Participant identity", "UNAVAILABLE", "UNAVAILABLE — aggregated depth does not identify unique traders"]];
+  $("intel-metrics").innerHTML = metricsHtml.map(([label, value, meta]) => `<div class="intel-metric"><span>${label}</span><b>${esc(value)}</b><small>${esc(meta)}</small></div>`).join("");
+  const scenarioBull = pressure > 5 && flowDelta >= 0, scenarioBear = pressure < -5 && flowDelta <= 0, title = scenarioBull ? "Bid-side pressure with bullish flow alignment" : scenarioBear ? "Ask-side pressure with bearish flow alignment" : pressure > 5 ? "Bid side is stronger, but flow confirmation is mixed" : pressure < -5 ? "Ask side is stronger, but flow confirmation is mixed" : "Balanced displayed liquidity · no directional confirmation";
+  const scenarioText = scenarioBull ? `Bid depth is stronger and aggressive buy flow is aligned. This is a measured displayed-pressure scenario; it is not a directional certainty.` : scenarioBear ? `Ask depth is stronger and aggressive sell flow is aligned. This is a measured displayed-pressure scenario; it is not a directional certainty.` : pressure > 5 ? `Bid side is stronger than ask side, but executed flow is not confirming. Treat current bids as passive support; absorption is not yet confirmed.` : pressure < -5 ? `Ask side is stronger than bid side, but executed flow is not confirming. Treat current asks as passive resistance; initiative selling is not yet confirmed.` : `Visible depth and executed flow are not sufficiently asymmetric for a directional scenario.`;
+  setText("intel-scenario-title", title); setText("intel-scenario-text", scenarioText);
+  const primary = scenarioBull ? zones.up : zones.down, obstacle = scenarioBull ? clusters.find(row => row.side === "ASK") : clusters.find(row => row.side === "BID");
+  $("intel-chain").innerHTML = [["Current state", pressure > 5 ? "Bid liquidity is visible" : pressure < -5 ? "Ask liquidity is visible" : "Depth is balanced"],["Cause", `${flow.count} trades · ${flowDelta >= 0 ? "aggressive buy" : "aggressive sell"} delta ${usd(Math.abs(flowDelta))}`],["Trigger", primary ? `${primary.side === "ASK" ? "Ask" : "Bid"} cluster at ${usd(primary.price)} is consumed / replenished` : "Validated cluster required"],["Immediate result", primary ? `Acceptance or rejection at ${usd(primary.price)}` : "No verified path"],["Next effect", primary ? `Stop pressure is estimated near ${usd(primary.price)}` : "No estimated cascade path"],["Obstacle", obstacle ? `${obstacle.status} at ${usd(obstacle.price)}` : "UNAVAILABLE"]].map(([label, value]) => `<div class="chain-step"><b>${label}</b>${esc(value)}</div>`).join("");
+  $("intel-target").innerHTML = primary ? `<div class="target-grid"><div><span>TARGET · ${primary.side === "ASK" ? "UP" : "DOWN"}</span><b>${usd(primary.price)}</b></div><div><span>P(TARGET TOUCH)</span><b>UNTRAINED</b></div><div><span>ETTT</span><b>INSUFFICIENT SAMPLE</b></div><div><span>TRIGGER</span><b>${usd(primary.price)} interaction</b></div><div><span>OBSTACLE</span><b>${obstacle ? usd(obstacle.price) : "UNAVAILABLE"}</b></div><div><span>CASCADE RISK</span><b>${state.oi ? "ESTIMATED · OI CONTEXT" : "UNAVAILABLE"}</b></div></div>` : `<div class="empty-state">TARGET UNAVAILABLE · no validated liquidity path</div>`;
+  setText("intel-invalidation", primary ? `If trigger fails: replenishment rises + ${flowDelta >= 0 ? "aggressive buy weakens" : "aggressive sell weakens"} → scenario invalidated. Probability: UNCALIBRATED.` : "Trigger state unavailable.");
+  const bidShare = metrics.bidNotional / Math.max(metrics.bidNotional + metrics.askNotional, 1) * 100, askShare = 100 - bidShare;
+  $("orderbook-summary-table").innerHTML = [["BID",metrics.bidLevels,metrics.bidBtc,metrics.bidNotional,bidShare,metrics.bids[0]?.p, summarizeLevels(metrics.bids,"bid").added,summarizeLevels(metrics.bids,"bid").removed],["ASK",metrics.askLevels,metrics.askBtc,metrics.askNotional,askShare,metrics.asks[0]?.p,summarizeLevels(metrics.asks,"ask").added,summarizeLevels(metrics.asks,"ask").removed]].map(row => `<tr><td class="${row[0] === "BID" ? "buy-text" : "sell-text"}">${row[0]}</td><td>${fmt(row[1],0)}</td><td>${fmt(row[2],2)}</td><td>${usd(row[3])}</td><td>${fmt(row[4],1)}%</td><td>${usd(row[5])}</td><td>${fmt(row[6],2)}</td><td>${fmt(row[7],2)}</td></tr>`).join("");
+  $("size-buckets-table").innerHTML = bucketSummaries(metrics).map(row => { const largest = Math.max(row.bid.largest?.q || 0, row.ask.largest?.q || 0); return `<tr><td>${row.label}</td><td>${row.bid.count}</td><td>${fmt(row.bid.btc,2)}</td><td>${usd(row.bid.notional)}</td><td>${row.ask.count}</td><td>${fmt(row.ask.btc,2)}</td><td>${usd(row.ask.notional)}</td><td class="${row.dominance >= 0 ? "buy-text" : "sell-text"}">${row.dominance >= 0 ? "+" : ""}${fmt(row.dominance,1)}%</td><td>${fmt(row.bid.nearestBps ?? row.ask.nearestBps,1)} / ${fmt(((row.bid.averageDistanceBps || 0) + (row.ask.averageDistanceBps || 0)) / 2,1)} bp</td><td>${fmt(largest,2)} BTC</td><td>${fmt(Math.max(row.bid.averageLifetime,row.ask.averageLifetime) / 1000,1)}s</td><td class="muted-cell">${fmt(row.bid.added + row.ask.added,1)} / ${fmt(row.bid.removed + row.ask.removed,1)} / ${fmt(row.bid.replenished + row.ask.replenished,1)} / ${fmt(row.bid.pulled + row.ask.pulled,1)}</td></tr>`; }).join("");
+  $("clusters-table").innerHTML = clusters.slice(0, 8).map(row => `<tr><td class="${row.side === "BID" ? "buy-text" : "sell-text"}">${row.side}</td><td>${usd(row.low)}–${usd(row.high)}</td><td>${fmt(row.distancePct,2)}% / ${fmt(row.distanceBps,1)} bp / ${row.distanceAtr == null ? "—" : `${fmt(row.distanceAtr,2)} ATR`}</td><td>${fmt(row.btc,2)}</td><td>${usd(row.notional)}</td><td>${fmt(row.persistence,1)}s</td><td>${row.replenishment > .25 ? "REPLENISHING" : row.depletion > 0 ? "DEPLETING" : "MIXED"}</td><td class="${row.status === "SPOOF_WATCH" ? "subtle-warning" : ""}">${row.status}</td></tr>`).join("") || `<tr><td colspan="8" class="empty-state">No nearby visible cluster in current book</td></tr>`;
+}
+
+function renderAll() { renderHeader(); renderBook(); renderTape(); renderFlow(); renderLiquidations(); renderDerivatives(); renderContext(); renderHealth(); renderDecision(); renderIntelligence(); }
 
 function setupNav() {
   document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => {
@@ -464,7 +609,7 @@ async function boot() {
   } else {
     await Promise.all([loadHistory(), loadDerivatives()]); openStream(); setInterval(loadDerivatives, 30000); setInterval(pollKline, 5000); pollKline();
   }
-  setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderLiquidations, 5000); renderAll(); log("Terminal booted in read-only research mode", "good");
+  setInterval(renderHealth, 1000); setInterval(renderHeader, 1000); setInterval(renderDecision, 1000); setInterval(renderIntelligence, 1000); setInterval(renderLiquidations, 5000); renderAll(); log("Terminal booted in read-only research mode", "good");
 }
 
 boot();

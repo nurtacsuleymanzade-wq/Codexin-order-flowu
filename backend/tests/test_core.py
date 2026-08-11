@@ -32,6 +32,19 @@ class OrderBookTests(unittest.TestCase):
         self.assertTrue(book.valid)
         self.assertEqual(book.last_update_id, 101)
 
+    def test_visible_totals_are_real_aggregated_levels(self):
+        book = LocalOrderBook()
+        book.reset(self.snapshot())
+        book.apply({"U": 101, "u": 101, "pu": 100, "b": [], "a": []})
+        metrics = book.metrics()
+        self.assertEqual(metrics["bid_levels"], 2)
+        self.assertEqual(metrics["ask_levels"], 2)
+        self.assertAlmostEqual(metrics["bid_btc"], 3)
+        self.assertAlmostEqual(metrics["ask_btc"], 3)
+        self.assertLess(metrics["bids"][0]["price"], metrics["asks"][0]["price"])
+        self.assertNotIn("unique_buyers", metrics)
+        self.assertNotIn("unique_sellers", metrics)
+
 
 class MarketStateTests(unittest.TestCase):
     def test_trade_metrics_have_event_and_receive_times(self):
