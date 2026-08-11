@@ -18,11 +18,13 @@ NO TRADE gate when evidence is missing, stale or invalid
 
 ### Contract boundaries
 
-- `aggTrade` is executed Futures flow. It is not a reconstructed order book.
+- `trade` is executed Futures flow. It is not a reconstructed order book.
 - `depth@100ms` is applied only after a Futures REST snapshot and sequence continuity checks.
 - `bookTicker` is a best-bid/best-ask reference. It does not validate the full L2 book.
 - `kline` is used for chart context; the open candle is not treated as a closed structure candle.
+- `forceOrder` is the observed liquidation tape. A quiet stream is not converted into synthetic liquidation events.
 - Open interest, funding and public long/short ratios are REST context feeds.
+- CVD and VWAP are session measurements derived from the received Futures trade stream.
 - Resting liquidity is observed displayed intent, not proof of execution or absorption.
 - Liquidation zones are estimated from an OI/leverage prior and are never labeled as observed force orders.
 
