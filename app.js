@@ -9,7 +9,7 @@ const CONFIG = {
   market: "USD-M FUTURES",
   rest: "https://fapi.binance.com/fapi/v1",
   ws: "wss://fstream.binance.com/stream?streams=",
-  backend: (new URLSearchParams(window.location.search).get("api") || window.CODEXIN_API_BASE || "").replace(/\/$/, ""),
+  backend: (new URLSearchParams(window.location.search).get("api") || window.CODEXIN_API_BASE || "https://nce-api.78.46.134.148.sslip.io/api/v2").replace(/\/$/, ""),
   maxTrades: 600,
   maxTape: 32,
   bookLevels: 18,
