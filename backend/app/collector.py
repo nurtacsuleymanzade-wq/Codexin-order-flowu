@@ -32,7 +32,7 @@ class BinanceCollector:
     @property
     def streams(self) -> str:
         symbol = self.settings.symbol.lower()
-        return "/".join((f"{symbol}@trade", f"{symbol}@depth@100ms", f"{symbol}@bookTicker", f"{symbol}@forceOrder"))
+        return "/".join((f"{symbol}@trade", f"{symbol}@depth@100ms", f"{symbol}@bookTicker", f"{symbol}@forceOrder", f"{symbol}@markPrice@1s"))
 
     async def start(self) -> None:
         self.http = httpx.AsyncClient(timeout=8, headers={"User-Agent": "codexin-order-flow/0.3"})
@@ -65,7 +65,9 @@ class BinanceCollector:
                         elif "@depth" in stream or data.get("e") == "depthUpdate":
                             await self.on_depth(data)
                         elif "bookTicker" in stream or data.get("e") == "bookTicker":
-                            self.state.price = (float(data["b"]) + float(data["a"])) / 2
+                            self.state.best_bid = float(data["b"]); self.state.best_ask = float(data["a"]); self.state.price = (self.state.best_bid + self.state.best_ask) / 2; self.state.last_ticker_at = now_ms()
+                        elif "markPrice" in stream or data.get("e") == "markPriceUpdate":
+                            self.state.mark_price = float(data.get("p") or self.state.mark_price or 0); self.state.index_price = float(data.get("i") or self.state.index_price or 0); self.state.last_ws_at = now_ms()
                         elif "forceOrder" in stream or data.get("e") == "forceOrder":
                             self.state.liquidation(data); await self.store.enqueue("force_order", data, self.settings.symbol)
             except asyncio.CancelledError:
@@ -84,6 +86,7 @@ class BinanceCollector:
             book.apply(event); self.state.last_book_at = now_ms()
         except (SequenceGap, KeyError, TypeError, ValueError) as error:
             book.invalidate(); book.buffer(event); self.last_error = f"orderbook gap: {error}"
+            if not self.book_sync_lock.locked(): asyncio.create_task(self.sync_orderbook())
 
     async def sync_orderbook(self) -> None:
         if not self.http:
@@ -135,13 +138,13 @@ class BinanceCollector:
 
     def health(self) -> HealthContract:
         now = now_ms(); s = self.state; book = s.orderbook
-        def feed(status: str, timestamp: int | None, source: str, detail: str) -> dict[str, Any]: return {"status": status, "age_ms": s.age(timestamp, now), "source": source, "detail": detail}
+        def feed(status: str, timestamp: int | None, source: str, detail: str, methodology: str = "OBSERVED") -> dict[str, Any]: return {"status": status, "age_ms": s.age(timestamp, now), "timestamp": iso_ms(timestamp), "received_timestamp": iso_ms(timestamp), "source": source, "methodology": methodology, "confidence": "REAL" if status.startswith("LIVE") else "STALE_OR_UNAVAILABLE", "detail": detail}
         trade_status = "LIVE" if s.last_trade_at and now - s.last_trade_at < self.settings.trade_sla_ms else "STALE"
         book_status = "LIVE" if book.valid and s.last_book_at and now - s.last_book_at < self.settings.book_sla_ms else "INVALID" if not book.valid else "STALE"
         kline_status = "LIVE" if s.last_kline_at and now - s.last_kline_at < self.settings.kline_sla_ms else "STALE"
         oi_status = "LIVE" if s.last_oi_at and now - s.last_oi_at < self.settings.oi_sla_ms else "STALE" if s.open_interest is not None else "UNAVAILABLE"
         funding_status = "LIVE" if s.last_funding_at and now - s.last_funding_at < self.settings.funding_sla_ms else "STALE" if s.funding_rate is not None else "UNAVAILABLE"
         liquidation_status = "LIVE_QUIET" if self.connected and s.last_ws_at and now - s.last_ws_at < 5000 else "UNAVAILABLE"
-        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count}"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions")}
+        feeds = {"trades": feed(trade_status, s.last_trade_at, "BINANCE_FUTURES_TRADE", "@trade · isBuyerMaker side rule"), "orderbook": feed(book_status, s.last_book_at, "BINANCE_FUTURES_DEPTH", f"sequence={book.last_update_id} resync={book.resync_count} · aggregated price levels", "OBSERVED_AGGREGATED_L2"), "klines": feed(kline_status, s.last_kline_at, "BINANCE_FUTURES_REST", "1m closed/active candles"), "open_interest": feed(oi_status, s.last_oi_at, "BINANCE_FUTURES_REST", "SLA <60s"), "funding": feed(funding_status, s.last_funding_at, "BINANCE_FUTURES_REST", "SLA <2h"), "liquidations": feed(liquidation_status, s.last_liquidation_at, "BINANCE_FUTURES_FORCE_ORDER", "LIVE_QUIET means connected with no recent event"), "macro": feed("UNAVAILABLE", None, "NOT_CONNECTED", "Not used for decisions", "UNAVAILABLE")}
         critical = ("trades", "orderbook", "klines", "open_interest", "funding", "liquidations"); missing = [key for key in critical if not feeds[key]["status"].startswith("LIVE")]
         return {"overall": "LIVE" if not missing else "DEGRADED", "market": s.symbol, "venue": s.venue, "market_type": s.market, "decision_authorized": False, "feeds": feeds, "missing_data": missing + ["calibration"], "last_error": self.last_error, "generated_at": iso_ms(now) or ""}

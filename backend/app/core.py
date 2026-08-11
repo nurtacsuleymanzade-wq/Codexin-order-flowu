@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from math import isfinite
+from math import exp, isfinite
 from typing import Any
 
 
@@ -111,12 +111,17 @@ class LocalOrderBook:
     def metrics(self) -> dict[str, Any]:
         bids = sorted(({"price": float(p), "quantity": q} for p, q in self.bids.items()), key=lambda row: row["price"], reverse=True)
         asks = sorted(({"price": float(p), "quantity": q} for p, q in self.asks.items()), key=lambda row: row["price"])
-        if not self.valid or not bids or not asks:
+        if not self.valid or not bids or not asks or bids[0]["price"] >= asks[0]["price"]:
             return {"valid": False, "sequence": self.last_update_id, "resync_count": self.resync_count}
         mid = (bids[0]["price"] + asks[0]["price"]) / 2
         range_10bps = mid * 0.001
         bid_notional = sum(row["price"] * row["quantity"] for row in bids if row["price"] >= mid - range_10bps)
         ask_notional = sum(row["price"] * row["quantity"] for row in asks if row["price"] <= mid + range_10bps)
+        bid_btc = sum(row["quantity"] for row in bids); ask_btc = sum(row["quantity"] for row in asks)
+        total_notional = sum(row["price"] * row["quantity"] for row in bids + asks)
+        weighted_bid = sum(row["quantity"] * exp(-abs(row["price"] - mid) / (mid * 0.002)) for row in bids)
+        weighted_ask = sum(row["quantity"] * exp(-abs(row["price"] - mid) / (mid * 0.002)) for row in asks)
+        weighted_total = weighted_bid + weighted_ask
         total = bid_notional + ask_notional
         return {
             "valid": True,
@@ -124,8 +129,18 @@ class LocalOrderBook:
             "resync_count": self.resync_count,
             "mid": mid,
             "spread": asks[0]["price"] - bids[0]["price"],
+            "spread_bps": (asks[0]["price"] - bids[0]["price"]) / mid * 10000,
             "bid_notional_10bps": bid_notional,
             "ask_notional_10bps": ask_notional,
+            "bid_btc": bid_btc,
+            "ask_btc": ask_btc,
+            "bid_notional": sum(row["price"] * row["quantity"] for row in bids),
+            "ask_notional": sum(row["price"] * row["quantity"] for row in asks),
+            "bid_levels": len(bids),
+            "ask_levels": len(asks),
+            "microprice": (asks[0]["quantity"] * bids[0]["price"] + bids[0]["quantity"] * asks[0]["price"]) / (bids[0]["quantity"] + asks[0]["quantity"]),
+            "weighted_imbalance": (weighted_bid - weighted_ask) / weighted_total * 100 if weighted_total else 0,
+            "visible_notional": total_notional,
             "bid_share": bid_notional / total * 100 if total else 50,
             "ask_share": ask_notional / total * 100 if total else 50,
             "imbalance": (bid_notional - ask_notional) / total * 100 if total else 0,
@@ -154,6 +169,9 @@ class MarketState:
     last_ratio_at: int | None = None
     ws_connected_at: int | None = None
     last_ws_at: int | None = None
+    best_bid: float | None = None
+    best_ask: float | None = None
+    last_ticker_at: int | None = None
     liquidation_connected_at: int | None = None
     last_liquidation_at: int | None = None
     cvd: float = 0
@@ -206,7 +224,7 @@ class MarketState:
         current = now_ms(); metrics = self.orderbook.metrics()
         return {
             "market": {"venue": self.venue, "market": self.market, "symbol": self.symbol, "market_type": "PERPETUAL"},
-            "price": {"last": self.price, "mark": self.mark_price, "index": self.index_price},
+            "price": {"last": self.price, "mark": self.mark_price, "index": self.index_price, "best_bid": self.best_bid, "best_ask": self.best_ask},
             "flow": {"cvd": self.cvd, "vwap": self.vwap_pv / self.vwap_notional if self.vwap_notional else None, "trade_count": self.trade_count, "buckets": list(self.buckets.values())[-30:]},
             "derivatives": {"open_interest": self.open_interest, "funding_rate": self.funding_rate, "positioning": self.ratio},
             "orderbook": {**metrics, "age_ms": self.age(self.last_book_at)},
